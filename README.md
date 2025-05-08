@@ -22,3 +22,8 @@ It will return -1 on any error (file access, model format, image format, memory 
 
 
 Thats it. The library is designed to be easy to use with minimal API surface and no memory management required by the user
+
+
+If you have linking issues when running make, try the alternative make file "NoodleNetMakefile"
+
+make -f NoodleNetMakefile
