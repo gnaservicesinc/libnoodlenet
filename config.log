@@ -30,8 +30,8 @@ Kernel configured for up to 12 processors.
 Processor type: arm64e (ARM64E)
 Processors active: 0 1 2 3 4 5 6 7 8 9 10 11
 Primary memory available: 64.00 gigabytes
-Default processor set: 874 tasks, 4230 threads, 12 processors
-Load average: 3.15, Mach factor: 8.84
+Default processor set: 893 tasks, 4286 threads, 12 processors
+Load average: 3.89, Mach factor: 8.24
 /bin/machine           = unknown
 /usr/bin/oslevel       = unknown
 /bin/universe          = unknown
@@ -66,7 +66,6 @@ PATH: /Library/Frameworks/Python.framework/Versions/3.13/bin/
 PATH: /opt/Qt/6.7.0/macos/bin/
 PATH: /opt/Qt/6.7.0/macos/libexec/
 PATH: /opt/Qt/Tools/sdktool/libexec/
-PATH: /Library/Java/JavaVirtualMachines/jdk-24.jdk/Contents/Home/bin/
 PATH: /Users/andrewsmith/.cargo/bin/
 
 

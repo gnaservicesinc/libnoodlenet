@@ -45,6 +45,7 @@ static int simple_resize_image(const unsigned char* src, int src_width, int src_
 #define EXPECTED_OUTPUT_NEURONS 1
 #define PREDICTION_THRESHOLD 0.5f
 #define MODEL_MAGIC_NUMBER 0x4D4E4553 // "SENM" in little-endian (S E N M)
+#define MODEL_MAGIC_NUMBER_REVERSED 0x53454E4D // "SENM" in big-endian (M N E S)
 #define MODEL_FORMAT_VERSION 1
 
 // --- Helper Structures ---
@@ -168,10 +169,10 @@ static int load_model_from_file(const char* model_path, MLPModel* model) {
     // Read Magic Number
     unsigned int magic_num_read;
     if (fread(&magic_num_read, sizeof(unsigned int), 1, fp) != 1) { error_occurred = 1; goto read_error; }
-    // Assuming host and file are same endianness for magic number, or use explicit byte swapping.
-    // For simplicity, we'll assume direct comparison works for now.
-    if (magic_num_read != MODEL_MAGIC_NUMBER) { // Simple check, assumes matching endianness for this uint32
-        fprintf(stderr, "NoodleNet Error: Invalid model magic number. Expected 0x%X, got 0x%X\n", MODEL_MAGIC_NUMBER, magic_num_read);
+    // Check for both possible magic number formats for compatibility
+    if (magic_num_read != MODEL_MAGIC_NUMBER && magic_num_read != MODEL_MAGIC_NUMBER_REVERSED) {
+        fprintf(stderr, "NoodleNet Error: Invalid model magic number. Expected 0x%X or 0x%X, got 0x%X\n",
+                MODEL_MAGIC_NUMBER, MODEL_MAGIC_NUMBER_REVERSED, magic_num_read);
         error_occurred = 1; goto read_error;
     }
 
