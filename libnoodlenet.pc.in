@@ -1,0 +1,10 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: libnoodlenet
+Description: A simple library for using sensuser models in C/C++ projects
+Version: @VERSION@
+Libs: -L${libdir} -lnoodlenet
+Cflags: -I${includedir}
