@@ -1,0 +1,10 @@
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libnoodlenet
+Description: A simple library for using sensuser models in C/C++ projects
+Version: 1.0
+Libs: -L${libdir} -lnoodlenet
+Cflags: -I${includedir}
