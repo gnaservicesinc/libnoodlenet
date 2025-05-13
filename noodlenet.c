@@ -46,7 +46,7 @@ static int simple_resize_image(const unsigned char* src, int src_width, int src_
 #define PREDICTION_THRESHOLD 0.5f
 #define MODEL_MAGIC_NUMBER 0x4D4E4553 // "SENM" in little-endian (S E N M)
 #define MODEL_MAGIC_NUMBER_REVERSED 0x53454E4D // "SENM" in big-endian (M N E S)
-#define MODEL_FORMAT_VERSION 1
+#define MODEL_FORMAT_VERSION 2
 
 // --- Helper Structures ---
 typedef struct {
@@ -179,8 +179,8 @@ static int load_model_from_file(const char* model_path, MLPModel* model) {
     // Read Format Version
     unsigned char version_read;
     if (fread(&version_read, sizeof(unsigned char), 1, fp) != 1) { error_occurred = 1; goto read_error; }
-    if (version_read != MODEL_FORMAT_VERSION) {
-        fprintf(stderr, "NoodleNet Error: Unsupported model format version. Expected %d, got %d\n", MODEL_FORMAT_VERSION, version_read);
+    if (version_read != MODEL_FORMAT_VERSION && version_read != 1) {
+        fprintf(stderr, "NoodleNet Error: Unsupported model format version. Expected %d or 1, got %d\n", MODEL_FORMAT_VERSION, version_read);
         error_occurred = 1; goto read_error;
     }
 
@@ -224,30 +224,64 @@ static int load_model_from_file(const char* model_path, MLPModel* model) {
     }
 
     // For simplicity, assuming "sigmoid" for all activations
-    cJSON* hidden_act_json = cJSON_GetObjectItemCaseSensitive(arch_json, "hidden_activation");
     cJSON* output_act_json = cJSON_GetObjectItemCaseSensitive(arch_json, "output_activation");
-    if (!cJSON_IsString(hidden_act_json) || strcmp(hidden_act_json->valuestring, "sigmoid") != 0 ||
-        !cJSON_IsString(output_act_json) || strcmp(output_act_json->valuestring, "sigmoid") != 0) {
-        fprintf(stderr, "NoodleNet Error: Model activation functions must be 'sigmoid' for this library version.\n");
+    if (!cJSON_IsString(output_act_json) || strcmp(output_act_json->valuestring, "sigmoid") != 0) {
+        fprintf(stderr, "NoodleNet Error: Model output activation function must be 'sigmoid' for this library version.\n");
         error_occurred = 1; goto parse_error_msg;
     }
 
-    cJSON* hidden_layers_json = cJSON_GetObjectItemCaseSensitive(arch_json, "hidden_layers_neurons");
-    if (!cJSON_IsArray(hidden_layers_json)) { error_occurred = 1; goto parse_error_msg; }
+    // Get hidden layers configuration
+    cJSON* hidden_layers_json = cJSON_GetObjectItemCaseSensitive(arch_json, "hidden_layers");
+    if (!cJSON_IsArray(hidden_layers_json)) {
+        // Try old format key for backward compatibility
+        hidden_layers_json = cJSON_GetObjectItemCaseSensitive(arch_json, "hidden_layers_neurons");
+        if (!cJSON_IsArray(hidden_layers_json)) {
+            error_occurred = 1; goto parse_error_msg;
+        }
+    }
 
     model->arch.num_hidden_layers = cJSON_GetArraySize(hidden_layers_json);
-    if (model->arch.num_hidden_layers <= 0) { // Must have at least one hidden layer for this structure
-         fprintf(stderr, "NoodleNet Error: Model must have at least one hidden layer.\n");
-         error_occurred = 1; goto parse_error_msg;
+
+    // Allow models with no hidden layers (direct input to output) in format version 2
+    if (version_read == 1 && model->arch.num_hidden_layers <= 0) {
+        fprintf(stderr, "NoodleNet Error: Format version 1 models must have at least one hidden layer.\n");
+        error_occurred = 1; goto parse_error_msg;
     }
 
     model->arch.hidden_neurons_per_layer = (int*)malloc(model->arch.num_hidden_layers * sizeof(int));
-    if (!model->arch.hidden_neurons_per_layer) { error_occurred = 1; goto malloc_fail_msg; }
+    if (!model->arch.hidden_neurons_per_layer && model->arch.num_hidden_layers > 0) {
+        error_occurred = 1; goto malloc_fail_msg;
+    }
 
     for (int i = 0; i < model->arch.num_hidden_layers; ++i) {
-        cJSON* num = cJSON_GetArrayItem(hidden_layers_json, i);
-        if (!cJSON_IsNumber(num) || num->valueint <=0) { error_occurred = 1; goto parse_error_msg; }
-        model->arch.hidden_neurons_per_layer[i] = num->valueint;
+        cJSON* layer_item = cJSON_GetArrayItem(hidden_layers_json, i);
+        int neurons = 0;
+
+        if (version_read == 2) {
+            // New format: each item is an object with "neurons" and "activation"
+            if (!cJSON_IsObject(layer_item)) { error_occurred = 1; goto parse_error_msg; }
+
+            cJSON* neurons_json = cJSON_GetObjectItemCaseSensitive(layer_item, "neurons");
+            if (!cJSON_IsNumber(neurons_json) || neurons_json->valueint <= 0) {
+                error_occurred = 1; goto parse_error_msg;
+            }
+            neurons = neurons_json->valueint;
+
+            // Check activation (must be sigmoid for this library version)
+            cJSON* act_json = cJSON_GetObjectItemCaseSensitive(layer_item, "activation");
+            if (!cJSON_IsString(act_json) || strcmp(act_json->valuestring, "sigmoid") != 0) {
+                fprintf(stderr, "NoodleNet Error: Model hidden layer activation functions must be 'sigmoid' for this library version.\n");
+                error_occurred = 1; goto parse_error_msg;
+            }
+        } else {
+            // Old format: each item is just the number of neurons
+            if (!cJSON_IsNumber(layer_item) || layer_item->valueint <= 0) {
+                error_occurred = 1; goto parse_error_msg;
+            }
+            neurons = layer_item->valueint;
+        }
+
+        model->arch.hidden_neurons_per_layer[i] = neurons;
     }
 
     // --- Allocate memory for weights and biases ---
