@@ -581,18 +581,17 @@ static float perform_forward_pass(const MLPModel* model, const float* input_data
 
         for (int j = 0; j < current_layer_num_neurons; ++j) { // For each neuron in current layer
             float weighted_sum = 0.0f;
-            // Weights for neuron j are: W_0j, W_1j, ..., W_(prev_layer_num_neurons-1)j
-            // These are stored contiguously for neuron j if weights are [prev_neurons][curr_neurons]
-            // Or, if weights are [curr_neurons][prev_neurons], then access is different.
-            // Assuming weights are stored as a flat array: prev_layer_size * current_layer_size
-            // where weight from prev_i to curr_j is at index (j * prev_layer_size + i) OR (i * current_layer_size + j)
-            // Let's assume: weights[prev_idx * current_layer_size + current_idx]
-            // This means weights for neuron `j` are at `weights[0*CLS+j], weights[1*CLS+j], ...`
-            // Or, more commonly: weights from `prev_i` to `curr_j` is at `layer_weights[prev_i * current_layer_num_neurons + j]`
+            // Weights for neuron j are: W_j0, W_j1, ..., W_j(prev_layer_num_neurons-1)
+            // In sensuser, weights are stored in a matrix of shape (output_neurons, input_neurons)
+            // This means the weights for output neuron j are stored in row j
+            // When flattened to a 1D array, the weights for output neuron j start at index (j * prev_layer_num_neurons)
+            // So the weight connecting input neuron i to output neuron j is at index (j * prev_layer_num_neurons + i)
 
             for (int i = 0; i < prev_layer_num_neurons; ++i) { // For each neuron in previous layer
                 // Access weight from neuron i (previous) to neuron j (current)
-                weighted_sum += current_activations[i] * layer_weights[i * current_layer_num_neurons + j];
+                // In sensuser, weights are stored as (output_neuron, input_neuron)
+                // So we need to access as layer_weights[j * prev_layer_num_neurons + i]
+                weighted_sum += current_activations[i] * layer_weights[j * prev_layer_num_neurons + i];
             }
             weighted_sum += layer_biases[j];
             next_activations_buffer[j] = sigmoid(weighted_sum);
