@@ -75,6 +75,67 @@ static int bilinear_resize_image(const unsigned char* src, int src_width, int sr
     return 1;
 }
 
+// Helper function for bicubic interpolation
+static float cubic_hermite(float A, float B, float C, float D, float t) {
+    float a = -A/2.0f + (3.0f*B)/2.0f - (3.0f*C)/2.0f + D/2.0f;
+    float b = A - (5.0f*B)/2.0f + 2.0f*C - D/2.0f;
+    float c = -A/2.0f + C/2.0f;
+    float d = B;
+
+    return a*t*t*t + b*t*t + c*t + d;
+}
+
+// Bicubic resize function (more similar to Qt's smooth transformation)
+static int bicubic_resize_image(const unsigned char* src, int src_width, int src_height, int src_channels,
+                              unsigned char* dst, int dst_width, int dst_height) {
+    float x_ratio = (float)src_width / dst_width;
+    float y_ratio = (float)src_height / dst_height;
+
+    for (int y = 0; y < dst_height; y++) {
+        float src_y = y * y_ratio;
+        int src_y_int = (int)src_y;
+        float t_y = src_y - src_y_int;
+
+        for (int x = 0; x < dst_width; x++) {
+            float src_x = x * x_ratio;
+            int src_x_int = (int)src_x;
+            float t_x = src_x - src_x_int;
+
+            for (int c = 0; c < src_channels; c++) {
+                float cubic_x[4];
+
+                // For each of the 4 rows around the target pixel
+                for (int ky = -1; ky <= 2; ky++) {
+                    int py = src_y_int + ky;
+                    // Clamp py to valid range
+                    py = (py < 0) ? 0 : (py >= src_height) ? src_height - 1 : py;
+
+                    // Get the 4 pixels in this row
+                    unsigned char pixels[4];
+                    for (int kx = -1; kx <= 2; kx++) {
+                        int px = src_x_int + kx;
+                        // Clamp px to valid range
+                        px = (px < 0) ? 0 : (px >= src_width) ? src_width - 1 : px;
+                        pixels[kx+1] = src[(py * src_width + px) * src_channels + c];
+                    }
+
+                    // Interpolate horizontally
+                    cubic_x[ky+1] = cubic_hermite(pixels[0], pixels[1], pixels[2], pixels[3], t_x);
+                }
+
+                // Interpolate vertically
+                float result = cubic_hermite(cubic_x[0], cubic_x[1], cubic_x[2], cubic_x[3], t_y);
+
+                // Clamp result to valid range
+                result = (result < 0) ? 0 : (result > 255) ? 255 : result;
+
+                dst[(y * dst_width + x) * src_channels + c] = (unsigned char)result;
+            }
+        }
+    }
+    return 1;
+}
+
 // --- Configuration & Constants ---
 #define TARGET_WIDTH 512
 #define TARGET_HEIGHT 512
@@ -108,6 +169,9 @@ static float sigmoid(float x);
 static int simple_resize_image(const unsigned char* src, int src_width, int src_height, int src_channels,
                               unsigned char* dst, int dst_width, int dst_height);
 static int bilinear_resize_image(const unsigned char* src, int src_width, int src_height, int src_channels,
+                              unsigned char* dst, int dst_width, int dst_height);
+static float cubic_hermite(float A, float B, float C, float D, float t);
+static int bicubic_resize_image(const unsigned char* src, int src_width, int src_height, int src_channels,
                               unsigned char* dst, int dst_width, int dst_height);
 static int load_model_from_file(const char* model_path, MLPModel* model);
 static int load_and_process_image(const char* image_path, float* output_buffer);
@@ -435,8 +499,8 @@ static int load_and_process_image(const char* image_path, float* output_buffer) 
             stbi_image_free(img_data_orig);
             return -1;
         }
-        // Use bilinear resize function for better quality
-        int success = bilinear_resize_image(img_data_orig, width, height, channels,
+        // Use bicubic resize function for better quality (more similar to Qt's smooth transformation)
+        int success = bicubic_resize_image(img_data_orig, width, height, channels,
                                          img_data_resized, TARGET_WIDTH, TARGET_HEIGHT);
         if (!success) {
             fprintf(stderr, "NoodleNet Error: Failed to resize image '%s'.\n", image_path);
