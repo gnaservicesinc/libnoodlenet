@@ -12,7 +12,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
-// Simple resize function implementation instead of using stb_image_resize.h
+// Original nearest-neighbor resize function (kept for reference)
 static int simple_resize_image(const unsigned char* src, int src_width, int src_height, int src_channels,
                               unsigned char* dst, int dst_width, int dst_height) {
     // Simple nearest-neighbor resize
@@ -36,6 +36,43 @@ static int simple_resize_image(const unsigned char* src, int src_width, int src_
     }
 
     return 1; // Success
+}
+
+// Improved bilinear resize function for better quality
+static int bilinear_resize_image(const unsigned char* src, int src_width, int src_height, int src_channels,
+                              unsigned char* dst, int dst_width, int dst_height) {
+    float x_ratio = (float)src_width / dst_width;
+    float y_ratio = (float)src_height / dst_height;
+
+    for (int y = 0; y < dst_height; y++) {
+        float src_y = y * y_ratio;
+        int src_y_floor = (int)src_y;
+        int src_y_ceil = (src_y_floor == src_height - 1) ? src_y_floor : src_y_floor + 1;
+        float y_diff = src_y - src_y_floor;
+
+        for (int x = 0; x < dst_width; x++) {
+            float src_x = x * x_ratio;
+            int src_x_floor = (int)src_x;
+            int src_x_ceil = (src_x_floor == src_width - 1) ? src_x_floor : src_x_floor + 1;
+            float x_diff = src_x - src_x_floor;
+
+            for (int c = 0; c < src_channels; c++) {
+                // Get the four surrounding pixels
+                unsigned char top_left = src[(src_y_floor * src_width + src_x_floor) * src_channels + c];
+                unsigned char top_right = src[(src_y_floor * src_width + src_x_ceil) * src_channels + c];
+                unsigned char bottom_left = src[(src_y_ceil * src_width + src_x_floor) * src_channels + c];
+                unsigned char bottom_right = src[(src_y_ceil * src_width + src_x_ceil) * src_channels + c];
+
+                // Bilinear interpolation
+                float top = top_left * (1 - x_diff) + top_right * x_diff;
+                float bottom = bottom_left * (1 - x_diff) + bottom_right * x_diff;
+                float pixel = top * (1 - y_diff) + bottom * y_diff;
+
+                dst[(y * dst_width + x) * src_channels + c] = (unsigned char)pixel;
+            }
+        }
+    }
+    return 1;
 }
 
 // --- Configuration & Constants ---
@@ -68,6 +105,10 @@ typedef struct {
 // --- Forward Declarations of Static Helper Functions ---
 static void free_mlp_model(MLPModel* model);
 static float sigmoid(float x);
+static int simple_resize_image(const unsigned char* src, int src_width, int src_height, int src_channels,
+                              unsigned char* dst, int dst_width, int dst_height);
+static int bilinear_resize_image(const unsigned char* src, int src_width, int src_height, int src_channels,
+                              unsigned char* dst, int dst_width, int dst_height);
 static int load_model_from_file(const char* model_path, MLPModel* model);
 static int load_and_process_image(const char* image_path, float* output_buffer);
 static float perform_forward_pass(const MLPModel* model, const float* input_data);
@@ -394,8 +435,8 @@ static int load_and_process_image(const char* image_path, float* output_buffer) 
             stbi_image_free(img_data_orig);
             return -1;
         }
-        // Use our simple resize function
-        int success = simple_resize_image(img_data_orig, width, height, channels,
+        // Use bilinear resize function for better quality
+        int success = bilinear_resize_image(img_data_orig, width, height, channels,
                                          img_data_resized, TARGET_WIDTH, TARGET_HEIGHT);
         if (!success) {
             fprintf(stderr, "NoodleNet Error: Failed to resize image '%s'.\n", image_path);
