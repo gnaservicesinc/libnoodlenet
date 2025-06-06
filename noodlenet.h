@@ -9,6 +9,18 @@ extern "C" {
 #endif
 
 /**
+ * @brief Activation function types supported by NoodleNet
+ */
+typedef enum {
+    NN_ACTIVATION_FUNCTION_SIGMOID = 0,
+    NN_ACTIVATION_FUNCTION_TANH = 1,     // New
+    NN_ACTIVATION_FUNCTION_RELU = 2,     // New
+    NN_ACTIVATION_FUNCTION_LEAKY_RELU = 3, // New
+    // Keep this last for count
+    NN_ACTIVATION_FUNCTION_COUNT
+} ActivationFunction;
+
+/**
  * @brief Predicts using a NoodleNet model.
  *
  * Loads a model specified by model_path, loads and processes the image

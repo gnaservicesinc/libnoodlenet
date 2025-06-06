@@ -156,10 +156,18 @@ typedef struct {
     // These would be parsed and validated from JSON
 } ModelArchitecture;
 
+// Layer structure to store activation function pointers
+typedef struct {
+    ActivationFunction activation_function;
+    float (*activate)(float);
+    float (*derivative)(float);
+} _NoodleNetLayer;
+
 typedef struct {
     ModelArchitecture arch;
     float** weights; // Array of weight matrices (weights[0] = input_to_hidden1, weights[1] = hidden1_to_hidden2, ...)
     float** biases;  // Array of bias vectors
+    _NoodleNetLayer* layers; // Array of layer information including activation functions
     int num_weight_sets; // Equal to num_hidden_layers + 1
 } MLPModel;
 
@@ -253,11 +261,88 @@ static void free_mlp_model(MLPModel* model) {
         free(model->biases);
         model->biases = NULL;
     }
+
+    if (model->layers) {
+        free(model->layers);
+        model->layers = NULL;
+    }
+
     model->num_weight_sets = 0;
 }
 
 static float sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
+}
+
+// Tanh activation function
+static float tanh_activate(float x) {
+    return tanhf(x); // Use the standard library's tanhf for efficiency and precision
+}
+
+static float tanh_derivative(float x) {
+    float th = tanhf(x);
+    return 1.0f - (th * th);
+}
+
+// ReLU activation function
+static float relu_activate(float x) {
+    return (x > 0.0f) ? x : 0.0f;
+}
+
+static float relu_derivative(float x) {
+    return (x > 0.0f) ? 1.0f : 0.0f;
+}
+
+// Leaky ReLU activation function
+#define LEAKY_RELU_SLOPE 0.01f
+
+static float leaky_relu_activate(float x) {
+    return (x > 0.0f) ? x : LEAKY_RELU_SLOPE * x;
+}
+
+static float leaky_relu_derivative(float x) {
+    return (x > 0.0f) ? 1.0f : LEAKY_RELU_SLOPE;
+}
+
+// Helper function to set activation functions based on enum
+static void set_activation_functions(
+    _NoodleNetLayer* layer,
+    ActivationFunction func_type
+) {
+    layer->activation_function = func_type; // Store the enum type
+
+    switch (func_type) {
+        case NN_ACTIVATION_FUNCTION_TANH:
+            layer->activate = tanh_activate;
+            layer->derivative = tanh_derivative;
+            break;
+        case NN_ACTIVATION_FUNCTION_RELU:
+            layer->activate = relu_activate;
+            layer->derivative = relu_derivative;
+            break;
+        case NN_ACTIVATION_FUNCTION_LEAKY_RELU:
+            layer->activate = leaky_relu_activate;
+            layer->derivative = leaky_relu_derivative;
+            break;
+        case NN_ACTIVATION_FUNCTION_SIGMOID:
+        default: // Default to Sigmoid for safety/backwards compatibility
+            layer->activate = sigmoid;
+            layer->derivative = NULL; // We don't need derivative for inference
+            break;
+    }
+}
+
+// Helper function to parse activation function string to enum
+static ActivationFunction parse_activation_function(const char* activation_str) {
+    if (strcmp(activation_str, "tanh") == 0) {
+        return NN_ACTIVATION_FUNCTION_TANH;
+    } else if (strcmp(activation_str, "relu") == 0) {
+        return NN_ACTIVATION_FUNCTION_RELU;
+    } else if (strcmp(activation_str, "leaky_relu") == 0) {
+        return NN_ACTIVATION_FUNCTION_LEAKY_RELU;
+    } else {
+        return NN_ACTIVATION_FUNCTION_SIGMOID; // Default
+    }
 }
 
 static int load_model_from_file(const char* model_path, MLPModel* model) {
@@ -328,12 +413,13 @@ static int load_model_from_file(const char* model_path, MLPModel* model) {
         error_occurred = 1; goto parse_error_msg;
     }
 
-    // For simplicity, assuming "sigmoid" for all activations
+    // Parse output activation function
     cJSON* output_act_json = cJSON_GetObjectItemCaseSensitive(arch_json, "output_activation");
-    if (!cJSON_IsString(output_act_json) || strcmp(output_act_json->valuestring, "sigmoid") != 0) {
-        fprintf(stderr, "NoodleNet Error: Model output activation function must be 'sigmoid' for this library version.\n");
+    if (!cJSON_IsString(output_act_json)) {
+        fprintf(stderr, "NoodleNet Error: Model output activation function must be specified.\n");
         error_occurred = 1; goto parse_error_msg;
     }
+    ActivationFunction output_activation = parse_activation_function(output_act_json->valuestring);
 
     // Get hidden layers configuration
     cJSON* hidden_layers_json = cJSON_GetObjectItemCaseSensitive(arch_json, "hidden_layers");
@@ -358,9 +444,16 @@ static int load_model_from_file(const char* model_path, MLPModel* model) {
         error_occurred = 1; goto malloc_fail_msg;
     }
 
+    // Allocate memory for layer information (hidden layers + output layer)
+    model->layers = (_NoodleNetLayer*)malloc((model->arch.num_hidden_layers + 1) * sizeof(_NoodleNetLayer));
+    if (!model->layers && (model->arch.num_hidden_layers + 1) > 0) {
+        error_occurred = 1; goto malloc_fail_msg;
+    }
+
     for (int i = 0; i < model->arch.num_hidden_layers; ++i) {
         cJSON* layer_item = cJSON_GetArrayItem(hidden_layers_json, i);
         int neurons = 0;
+        ActivationFunction layer_activation = NN_ACTIVATION_FUNCTION_SIGMOID; // Default
 
         if (version_read == 2) {
             // New format: each item is an object with "neurons" and "activation"
@@ -372,22 +465,27 @@ static int load_model_from_file(const char* model_path, MLPModel* model) {
             }
             neurons = neurons_json->valueint;
 
-            // Check activation (must be sigmoid for this library version)
+            // Parse activation function
             cJSON* act_json = cJSON_GetObjectItemCaseSensitive(layer_item, "activation");
-            if (!cJSON_IsString(act_json) || strcmp(act_json->valuestring, "sigmoid") != 0) {
-                fprintf(stderr, "NoodleNet Error: Model hidden layer activation functions must be 'sigmoid' for this library version.\n");
-                error_occurred = 1; goto parse_error_msg;
+            if (cJSON_IsString(act_json)) {
+                layer_activation = parse_activation_function(act_json->valuestring);
             }
         } else {
-            // Old format: each item is just the number of neurons
+            // Old format: each item is just the number of neurons (default to sigmoid)
             if (!cJSON_IsNumber(layer_item) || layer_item->valueint <= 0) {
                 error_occurred = 1; goto parse_error_msg;
             }
             neurons = layer_item->valueint;
+            layer_activation = NN_ACTIVATION_FUNCTION_SIGMOID;
         }
 
         model->arch.hidden_neurons_per_layer[i] = neurons;
+        // Set activation function for this hidden layer
+        set_activation_functions(&model->layers[i], layer_activation);
     }
+
+    // Set activation function for output layer
+    set_activation_functions(&model->layers[model->arch.num_hidden_layers], output_activation);
 
     // --- Allocate memory for weights and biases ---
     model->num_weight_sets = model->arch.num_hidden_layers + 1;
@@ -594,7 +692,8 @@ static float perform_forward_pass(const MLPModel* model, const float* input_data
                 weighted_sum += current_activations[i] * layer_weights[j * prev_layer_num_neurons + i];
             }
             weighted_sum += layer_biases[j];
-            next_activations_buffer[j] = sigmoid(weighted_sum);
+            // Use the appropriate activation function for this layer
+            next_activations_buffer[j] = model->layers[layer_idx].activate(weighted_sum);
         }
 
         // Free previous layer's activations buffer (if it wasn't the input_data itself)
