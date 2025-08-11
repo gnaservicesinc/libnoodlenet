@@ -1,0 +1,129 @@
+User Manual: Build and Explore a Simple Image Classifier
+
+Welcome
+This project lets you build and explore a tiny neural network that learns from pictures. You can try ideas quickly, see what the network “looks at,” and understand what changes when you train it. You can use it three ways:
+- Sensuser: a windowed app with buttons and panels.
+- Bookish (CLI): a simple menu in the terminal.
+- Library (libnoodlenet): other apps can call the same features in code.
+
+Big Idea
+You give examples of pictures that mean “yes” (positive) and optionally “no” (negative). The network learns to tell them apart. You can then test it on other pictures. Along the way, you can save your work, load it later, and export pictures that show what the network has learned inside.
+
+How the Network Sees Images
+- Input size: 512×512 pixels, grayscale. If your image is not 512×512, it will be resized. If it is color, it will be converted to grayscale.
+- Output: one number from 0 to 1. Values near 1 mean “true/yes.” Values near 0 mean “false/no.”
+
+Model Basics
+- Layers: The model has an input layer (from the image), some hidden layers you choose, and one output neuron.
+- Hidden layer size: How many “neurons” are in that layer. More neurons can learn more patterns, but can also overfit (memorize instead of generalize) and run slower.
+- Activation function: How each neuron turns its input into an output. Choices:
+  - Sigmoid: S-shaped curve. Smooth, simple. Can be slow to learn deep patterns.
+  - Tanh: Like sigmoid but centered at zero. Often easier to learn than sigmoid.
+  - ReLU: Outputs zero for negative inputs and the input for positive ones. Learns fast. Can “die” for some neurons if learning rate is too high.
+  - Leaky ReLU: Like ReLU but allows a small negative slope. Helps avoid “dead” neurons.
+
+Training Options (what they mean)
+- Steps (epochs/updates): How long you train. More steps usually help until you start overfitting.
+- Batch size: How many images you learn from at once. Bigger batches can be steadier but need more memory.
+- Learning rate: How big the weight updates are. Too high: training bounces around. Too low: training is very slow.
+- L1 (weight penalty): Encourages many weights to be exactly zero (sparser). Helps fight overfitting. Too high can hurt learning.
+- L2 (weight decay): Shrinks weights smoothly toward zero. Helps fight overfitting. Too high can underfit.
+- Optimizer (how to update weights):
+  - SGD: Simple and predictable. Often needs a smaller learning rate and more steps.
+  - RMSprop: Adapts the step size. Works well on many problems without much tuning.
+  - Adam: Combines ideas of momentum and RMSprop. Often works best out of the box.
+
+Testing and Evaluation
+- Test a single image or a whole folder to see outputs.
+- Evaluation (Bookish): Runs through positive and negative folders to count true/false hits and report accuracy.
+
+Saving and Loading
+- Save a trained model to a file so you don’t lose your work.
+- Load it later to test, visualize, or keep training.
+
+Visualizations (seeing inside the network)
+These options export images (PGM files) that show what layers “look like.” You can open PGM files in most image viewers.
+
+1) Weights (Square)
+- What it shows: Each row represents one neuron’s incoming weights. Long rows are resampled into a square so the whole layer fits in a neat image (layer size × layer size).
+- Why useful: Easy to compare neurons and spot repeated patterns. Works for all layers.
+- Good to use: Most of the time when you want a clean, compact view.
+- Drawback: Rows are resampled to fit a square, so you don’t see every single input weight when the input is very large.
+
+2) Weights (Raw, Non‑Square)
+- What it shows: The full weight matrix with no resampling. Width = number of inputs to the layer. Height = number of neurons in the layer.
+- Why useful: Shows every weight value exactly as stored.
+- Good to use: When you need the exact picture of weights.
+
+
+3) Heatmap (Neuron Similarity)
+- What it shows: How similar neurons are to each other inside the same layer. Bright pixels mean two neurons behave alike; dark means they are different.
+- Why useful: Finds groups of neurons that do similar jobs.
+- Good to use: When you want to check if your layer has variety or if many neurons are redundant.
+- Notes: The diagonal line is always white. A neuron is always “most similar” to itself.
+
+Scaling Choices (how numbers turn into brightness)
+- Min/Max: The smallest value becomes black, and the largest becomes white. Good for making contrast clear.
+- Symmetric, Zero‑Centered: Values near zero become middle gray. Negative values are darker; positive values are brighter. Good for weights that go both positive and negative.
+
+Bias Images and Stats (optional extras)
+- Bias image: A 1×N image (one row) showing the bias for each neuron.
+- Stats files: Text files with min, max, mean, and standard deviation for the exported layer. These help you compare layers.
+
+When to Use Which Visualization
+- Want a quick overall look: Weights (Square) with Min/Max scaling.
+- Want to see sign and balance: Weights (Square) with Symmetric scaling.
+- Need exact weight values: Weights (Raw, Non‑Square). Be careful with huge sizes.
+- Curious about redundancy: Heatmap. Look for bright blocks off the main diagonal (similar groups).
+
+How to Do Things in Sensuser (windowed app)
+1) Create a model
+   - Choose how many hidden layers and how big each is.
+   - Pick an activation for each layer and for the output.
+2) Train
+   - Choose folders with positive images (and optionally negative images).
+   - Set steps, batch size, learning rate, and L1/L2 if you want.
+   - Start training and watch the loss curve.
+3) Test
+   - Load a picture to see the model’s output, or evaluate a folder to see accuracy.
+4) Visualize
+   - In the Hidden Layer tab, use the “Visualization Options” panel:
+     - Mode: weights or heatmap.
+     - Scaling: min/max or symmetric.
+     - Include biases and stats if you like.
+     - Raw weights (non‑square): on/off.
+   - Click “Export Visualizations…” and choose a folder. The app writes images and (optionally) stats files there.
+
+How to Do Things in Bookish (CLI)
+1) Start the program. You’ll see a numbered menu.
+2) Define a model (option 1).
+3) Define training (option 2) and run it (option 3).
+4) Save/Load as needed (options 4 and 5).
+5) Inspect and test (options 6 and 7).
+6) Configure visualization options (option 10)
+   - Choose weights/heatmap, scaling, include biases/stats, and raw weights.
+7) Export visualizations (option 8) and enter an output folder path.
+   - Tip: If you drag a path into Terminal, it might add a space at the end. The program trims trailing spaces, so it should “just work.”
+
+Tips for Better Results
+- Use images that match your goal. If you want to detect birds, use pictures with and without birds.
+- Keep image variety. Different angles, backgrounds, and lighting help the model learn general patterns.
+- Watch the learning rate. If loss jumps around or goes to “nan,” try a smaller learning rate.
+- Try different optimizers. Adam is a solid default; RMSprop is also good.
+- Use regularization (L1/L2) if training accuracy is high but test accuracy is low.
+
+Common Questions
+- “Why is the heatmap’s diagonal white?”
+  Because each neuron is perfectly similar to itself.
+- “Why is the raw weights image so huge?”
+  The first layer sees all 512×512 input pixels. That’s 262,144 values per neuron. The picture must be very wide to show that.
+- “Why do my weight images look mostly gray?”
+  Try Symmetric scaling to spread values around middle gray. Or try more training steps.
+
+About the Library (for other apps)
+- Other apps can call the same features through the open-source libnoodlenet library. The visualizations, training, and prediction features are all available from code.
+- This manual describes what the features do and why you might use them. The exact buttons and menus described above are for Sensuser and Bookish.
+
+Have Fun Exploring
+Play with layer sizes, activations, and training settings. Save snapshots, export visualizations, and compare. There is no single “right” setup—experimenting is how you learn what each choice does.
+
