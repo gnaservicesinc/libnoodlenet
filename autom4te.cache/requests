@@ -12,8 +12,13 @@
                       [
                         '/usr/local/share/autoconf/autoconf/autoconf.m4f',
                         '/usr/local/share/aclocal-1.17/internal/ac-config-macro-dirs.m4',
+                        '/usr/local/share/aclocal/libtool.m4',
                         '/usr/local/share/aclocal/ltargz.m4',
                         '/usr/local/share/aclocal/ltdl.m4',
+                        '/usr/local/share/aclocal/ltoptions.m4',
+                        '/usr/local/share/aclocal/ltsugar.m4',
+                        '/usr/local/share/aclocal/ltversion.m4',
+                        '/usr/local/share/aclocal/lt~obsolete.m4',
                         '/usr/local/share/aclocal-1.17/amversion.m4',
                         '/usr/local/share/aclocal-1.17/ar-lib.m4',
                         '/usr/local/share/aclocal-1.17/auxdir.m4',
@@ -35,11 +40,6 @@
                         '/usr/local/share/aclocal-1.17/substnot.m4',
                         '/usr/local/share/aclocal-1.17/tar.m4',
                         '/usr/local/share/aclocal-1.17/xargsn.m4',
-                        'm4/libtool.m4',
-                        'm4/ltoptions.m4',
-                        'm4/ltsugar.m4',
-                        'm4/ltversion.m4',
-                        'm4/lt~obsolete.m4',
                         'configure.ac'
                       ],
                       {

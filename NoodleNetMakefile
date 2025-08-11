@@ -6,9 +6,9 @@ CXX ?= g++
 LD ?= $(CC) # Linker, usually the same as the C compiler for C projects or CXX for C++
 
 # Common flags
-CFLAGS_COMMON = -std=c11 -Wall -Wextra -O2
-CXXFLAGS_COMMON = -std=c++11 -Wall -Wextra -O2
-LDFLAGS_COMMON =
+CFLAGS_COMMON ?= -std=c11 -Wall -Wextra -O3
+CXXFLAGS_COMMON ?= -std=c++11 -Wall -Wextra -O3
+LDFLAGS_COMMON ?= --for-linker -rpath /usr/local/lib
 
 # Source files
 C_SOURCES = noodlenet.c cJSON.c

@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h> // For expf (sigmoid)
+#include <time.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 // STB Image Loading Library (Single Header)
 #define STB_IMAGE_IMPLEMENTATION
@@ -169,7 +173,20 @@ typedef struct {
     float** biases;  // Array of bias vectors
     _NoodleNetLayer* layers; // Array of layer information including activation functions
     int num_weight_sets; // Equal to num_hidden_layers + 1
+    // Optimizer state
+    NN_Optimizer optimizer;
+    float beta1;
+    float beta2;
+    float epsilon;
+    int adam_timestep;
+    float** m_weights; // moments for Adam
+    float** v_weights; // moments for Adam/RMSprop
+    float** m_biases;
+    float** v_biases;
 } MLPModel;
+
+// Public opaque alias
+struct NN_Model { MLPModel impl; };
 
 // --- Forward Declarations of Static Helper Functions ---
 static void free_mlp_model(MLPModel* model);
@@ -184,6 +201,18 @@ static int bicubic_resize_image(const unsigned char* src, int src_width, int src
 static int load_model_from_file(const char* model_path, MLPModel* model);
 static int load_and_process_image(const char* image_path, float* output_buffer);
 static float perform_forward_pass(const MLPModel* model, const float* input_data);
+static void set_activation_functions(_NoodleNetLayer* layer, ActivationFunction func_type);
+static ActivationFunction parse_activation_function(const char* activation_str);
+static const char* activation_to_string(ActivationFunction a);
+static void init_random_weights(MLPModel* model);
+static void zero_model(MLPModel* model);
+static void free_string_array(char** list, int count);
+static int list_images_in_dir(const char* dir, char*** out_list, int* out_count);
+static float train_one_example(MLPModel* model, const float* x, float y, float lr, float l1, float l2);
+static float compute_loss_only(MLPModel* model, const float* x, float y);
+static int save_model_to_file(const MLPModel* model, const char* model_path);
+static float cosine_similarity(const float* a, const float* b, int n);
+static int write_pgm(const char* path, int w, int h, const unsigned char* data);
 
 // --- Public API Implementation ---
 int noodlenet_predict(const char* model_path, const char* image_path) {
@@ -267,11 +296,33 @@ static void free_mlp_model(MLPModel* model) {
         model->layers = NULL;
     }
 
+    if (model->m_weights) {
+        for (int i = 0; i < model->num_weight_sets; ++i) if (model->m_weights[i]) free(model->m_weights[i]);
+        free(model->m_weights); model->m_weights = NULL;
+    }
+    if (model->v_weights) {
+        for (int i = 0; i < model->num_weight_sets; ++i) if (model->v_weights[i]) free(model->v_weights[i]);
+        free(model->v_weights); model->v_weights = NULL;
+    }
+    if (model->m_biases) {
+        for (int i = 0; i < model->arch.num_hidden_layers + 1; ++i) if (model->m_biases[i]) free(model->m_biases[i]);
+        free(model->m_biases); model->m_biases = NULL;
+    }
+    if (model->v_biases) {
+        for (int i = 0; i < model->arch.num_hidden_layers + 1; ++i) if (model->v_biases[i]) free(model->v_biases[i]);
+        free(model->v_biases); model->v_biases = NULL;
+    }
+
     model->num_weight_sets = 0;
 }
 
 static float sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
+}
+
+static float sigmoid_derivative(float x) {
+    float s = sigmoid(x);
+    return s * (1.0f - s);
 }
 
 // Tanh activation function
@@ -325,9 +376,9 @@ static void set_activation_functions(
             layer->derivative = leaky_relu_derivative;
             break;
         case NN_ACTIVATION_FUNCTION_SIGMOID:
-        default: // Default to Sigmoid for safety/backwards compatibility
+        default:
             layer->activate = sigmoid;
-            layer->derivative = NULL; // We don't need derivative for inference
+            layer->derivative = sigmoid_derivative;
             break;
     }
 }
@@ -342,6 +393,16 @@ static ActivationFunction parse_activation_function(const char* activation_str) 
         return NN_ACTIVATION_FUNCTION_LEAKY_RELU;
     } else {
         return NN_ACTIVATION_FUNCTION_SIGMOID; // Default
+    }
+}
+
+static const char* activation_to_string(ActivationFunction a) {
+    switch (a) {
+        case NN_ACTIVATION_FUNCTION_TANH: return "tanh";
+        case NN_ACTIVATION_FUNCTION_RELU: return "relu";
+        case NN_ACTIVATION_FUNCTION_LEAKY_RELU: return "leaky_relu";
+        case NN_ACTIVATION_FUNCTION_SIGMOID:
+        default: return "sigmoid";
     }
 }
 
@@ -649,6 +710,872 @@ static int load_and_process_image(const char* image_path, float* output_buffer) 
     return 0; // Success
 }
 
+// Initialize model weights with Xavier uniform and zero biases
+static void init_random_weights(MLPModel* model) {
+    srand((unsigned)time(NULL));
+    int prev = model->arch.input_neurons;
+    for (int i = 0; i < model->num_weight_sets; ++i) {
+        int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
+                                                       : model->arch.output_neurons;
+        long n = (long)prev * curr;
+        float limit = sqrtf(6.0f / (prev + curr));
+        for (long k = 0; k < n; ++k) {
+            float r = (float)rand() / (float)RAND_MAX; // [0,1]
+            model->weights[i][k] = -limit + 2.0f * limit * r;
+        }
+        for (int j = 0; j < curr; ++j) {
+            model->biases[i][j] = 0.0f;
+        }
+        prev = curr;
+    }
+}
+
+static void zero_model(MLPModel* model) {
+    if (!model) return;
+    memset(model, 0, sizeof(*model));
+}
+
+static void free_string_array(char** list, int count) {
+    if (!list) return;
+    for (int i = 0; i < count; ++i) free(list[i]);
+    free(list);
+}
+
+static int ends_with_case(const char* s, const char* suf) {
+    size_t n = strlen(s), m = strlen(suf);
+    if (m > n) return 0;
+    const char* a = s + (n - m);
+    for (size_t i = 0; i < m; ++i) {
+        char c1 = a[i];
+        char c2 = suf[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 = (char)(c1 - 'A' + 'a');
+        if (c2 >= 'A' && c2 <= 'Z') c2 = (char)(c2 - 'A' + 'a');
+        if (c1 != c2) return 0;
+    }
+    return 1;
+}
+
+static int list_images_in_dir(const char* dir, char*** out_list, int* out_count) {
+    *out_list = NULL; *out_count = 0;
+    DIR* d = opendir(dir);
+    if (!d) return -1;
+    struct dirent* ent;
+    int cap = 32;
+    char** list = (char**)malloc(sizeof(char*) * cap);
+    if (!list) { closedir(d); return -1; }
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) continue;
+        if (!(ends_with_case(path, ".png") || ends_with_case(path, ".bmp") || ends_with_case(path, ".jpg") || ends_with_case(path, ".jpeg")))
+            continue;
+        if (*out_count >= cap) {
+            cap *= 2;
+            char** tmp = (char**)realloc(list, sizeof(char*) * cap);
+            if (!tmp) { free_string_array(list, *out_count); closedir(d); return -1; }
+            list = tmp;
+        }
+        list[*out_count] = strdup(path);
+        if (!list[*out_count]) { free_string_array(list, *out_count); closedir(d); return -1; }
+        (*out_count)++;
+    }
+    closedir(d);
+    *out_list = list;
+    return 0;
+}
+
+// Train a single (x,y) example using SGD; returns loss
+static float train_one_example(MLPModel* model, const float* x, float y, float lr, float l1, float l2) {
+    int L = model->num_weight_sets; // number of layers with parameters
+    if (model->optimizer == NN_OPTIMIZER_ADAM) {
+        model->adam_timestep += 1;
+    }
+    // Allocate activations and z's
+    float** a = (float**)calloc(L + 1, sizeof(float*)); // a[0]=input, a[L]=output
+    float** z = (float**)calloc(L, sizeof(float*));
+    float** delta = (float**)calloc(L, sizeof(float*));
+    if (!a || !z || !delta) { free(a); free(z); free(delta); return NAN; }
+
+    int prev = model->arch.input_neurons;
+    a[0] = (float*)x; // do not own
+
+    // Forward
+    for (int i = 0; i < L; ++i) {
+        int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
+                                                       : model->arch.output_neurons;
+        z[i] = (float*)malloc(sizeof(float) * curr);
+        a[i+1] = (float*)malloc(sizeof(float) * curr);
+        if (!z[i] || !a[i+1]) goto oom;
+        // z = W * a_prev + b
+        float* Wi = model->weights[i];
+        float* bi = model->biases[i];
+        for (int r = 0; r < curr; ++r) {
+            double sum = bi[r];
+            const float* wrow = Wi + (long)r * prev;
+            for (int c = 0; c < prev; ++c) sum += wrow[c] * a[i][c];
+            z[i][r] = (float)sum;
+            a[i+1][r] = model->layers[i].activate(z[i][r]);
+        }
+        prev = curr;
+    }
+
+    // Loss (binary cross-entropy)
+    float o = a[L][0];
+    if (o < 1e-7f) o = 1e-7f; if (o > 1.0f - 1e-7f) o = 1.0f - 1e-7f;
+    float loss = -(y * logf(o) + (1.0f - y) * logf(1.0f - o));
+
+    // Backward
+    // Output delta: dL/da * da/dz
+    delta[L-1] = (float*)malloc(sizeof(float) * model->arch.output_neurons);
+    if (!delta[L-1]) goto oom;
+    // dL/da = -(y/o) + (1-y)/(1-o)
+    float dL_da = -(y / o) + ((1.0f - y) / (1.0f - o));
+    float da_dz;
+    // derivative for output activation
+    float zL = z[L-1][0];
+    if (model->layers[L-1].derivative) da_dz = model->layers[L-1].derivative(zL);
+    else { // fallback for sigmoid
+        float s = 1.0f / (1.0f + expf(-zL));
+        da_dz = s * (1.0f - s);
+    }
+    delta[L-1][0] = dL_da * da_dz;
+
+    // Hidden deltas
+    for (int i = L-2; i >= 0; --i) {
+        int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
+                                                       : model->arch.output_neurons; // not used
+        int next = (i+1 < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i+1]
+                                                         : model->arch.output_neurons;
+        delta[i] = (float*)malloc(sizeof(float) * curr);
+        if (!delta[i]) goto oom;
+        for (int r = 0; r < curr; ++r) {
+            double sum = 0.0;
+            // sum_j W_{j,r}^{i+1} * delta_{j}^{i+1}
+            float* Wnext = model->weights[i+1];
+            for (int j = 0; j < next; ++j) {
+                sum += Wnext[(long)j * curr + r] * delta[i+1][j];
+            }
+            float dz = model->layers[i].derivative(z[i][r]);
+            delta[i][r] = (float)(sum * dz);
+        }
+    }
+
+    // Update weights depending on optimizer (SGD/RMSprop/Adam) with L1/L2 on weights
+    prev = model->arch.input_neurons;
+    for (int i = 0; i < L; ++i) {
+        int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
+                                                       : model->arch.output_neurons;
+        float* Wi = model->weights[i];
+        float* bi = model->biases[i];
+        float* mW = model->m_weights ? model->m_weights[i] : NULL;
+        float* vW = model->v_weights ? model->v_weights[i] : NULL;
+        for (int r = 0; r < curr; ++r) {
+            // bias grad
+            float g_b = delta[i][r];
+            // apply optimizer to bias
+            if (model->optimizer == NN_OPTIMIZER_SGD) {
+                bi[r] -= lr * g_b;
+            } else if (model->optimizer == NN_OPTIMIZER_RMSPROP) {
+                float* vB = model->v_biases[i];
+                vB[r] = model->beta2 * vB[r] + (1.0f - model->beta2) * g_b * g_b;
+                bi[r] -= lr * g_b / (sqrtf(vB[r]) + model->epsilon);
+            } else { // Adam
+                float* mB = model->m_biases[i];
+                float* vB = model->v_biases[i];
+                mB[r] = model->beta1 * mB[r] + (1.0f - model->beta1) * g_b;
+                vB[r] = model->beta2 * vB[r] + (1.0f - model->beta2) * (g_b * g_b);
+                float b1t = powf(model->beta1, (float)(model->adam_timestep + 1));
+                float b2t = powf(model->beta2, (float)(model->adam_timestep + 1));
+                float mhat = mB[r] / (1.0f - b1t);
+                float vhat = vB[r] / (1.0f - b2t);
+                bi[r] -= lr * mhat / (sqrtf(vhat) + model->epsilon);
+            }
+            // weights
+            float* wrow = Wi + (long)r * prev;
+            for (int c = 0; c < prev; ++c) {
+                float grad = delta[i][r] * a[i][c];
+                if (l2 > 0.0f) grad += l2 * wrow[c];
+                if (l1 > 0.0f) grad += l1 * (wrow[c] > 0.0f ? 1.0f : (wrow[c] < 0.0f ? -1.0f : 0.0f));
+                if (model->optimizer == NN_OPTIMIZER_SGD) {
+                    wrow[c] -= lr * grad;
+                } else if (model->optimizer == NN_OPTIMIZER_RMSPROP) {
+                    vW[(long)r * prev + c] = model->beta2 * vW[(long)r * prev + c] + (1.0f - model->beta2) * grad * grad;
+                    wrow[c] -= lr * grad / (sqrtf(vW[(long)r * prev + c]) + model->epsilon);
+                } else { // Adam
+                    mW[(long)r * prev + c] = model->beta1 * mW[(long)r * prev + c] + (1.0f - model->beta1) * grad;
+                    vW[(long)r * prev + c] = model->beta2 * vW[(long)r * prev + c] + (1.0f - model->beta2) * grad * grad;
+                    float b1t = powf(model->beta1, (float)(model->adam_timestep + 1));
+                    float b2t = powf(model->beta2, (float)(model->adam_timestep + 1));
+                    float mhat = mW[(long)r * prev + c] / (1.0f - b1t);
+                    float vhat = vW[(long)r * prev + c] / (1.0f - b2t);
+                    wrow[c] -= lr * mhat / (sqrtf(vhat) + model->epsilon);
+                }
+            }
+        }
+        prev = curr;
+    }
+
+    // Cleanup
+    for (int i = 0; i < L; ++i) { free(z[i]); free(delta[i]); }
+    for (int i = 1; i <= L; ++i) free(a[i]);
+    free(a); free(z); free(delta);
+    return loss;
+oom:
+    for (int i = 0; i < L; ++i) { if (z && z[i]) free(z[i]); if (delta && delta[i]) free(delta[i]); }
+    if (a) { for (int i = 1; i <= L; ++i) if (a[i]) free(a[i]); }
+    free(a); free(z); free(delta);
+    return NAN;
+}
+
+// Compute loss for (x,y) without updating parameters
+static float compute_loss_only(MLPModel* model, const float* x, float y) {
+    int L = model->num_weight_sets;
+    float** a = (float**)calloc(L + 1, sizeof(float*));
+    float** z = (float**)calloc(L, sizeof(float*));
+    if (!a || !z) { free(a); free(z); return NAN; }
+    a[0] = (float*)x; int prev = model->arch.input_neurons;
+    for (int i=0;i<L;++i) {
+        int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
+                                                       : model->arch.output_neurons;
+        z[i] = (float*)malloc(sizeof(float)*curr);
+        a[i+1] = (float*)malloc(sizeof(float)*curr);
+        if (!z[i] || !a[i+1]) { for (int k=0;k<=i;++k){ if(z[k])free(z[k]); if(k>0&&a[k])free(a[k]); } free(a); free(z); return NAN; }
+        const float* Wi = model->weights[i]; const float* bi = model->biases[i];
+        for (int r=0;r<curr;++r){ double sum=bi[r]; const float* wrow = Wi + (long)r * prev; for (int c=0;c<prev;++c) sum += wrow[c]*a[i][c]; z[i][r] = (float)sum; a[i+1][r] = model->layers[i].activate(z[i][r]); }
+        prev = curr;
+    }
+    float o = a[L][0]; if (o < 1e-7f) o = 1e-7f; if (o > 1.0f - 1e-7f) o = 1.0f - 1e-7f;
+    float loss = -(y * logf(o) + (1.0f - y) * logf(1.0f - o));
+    for (int i=0;i<L;++i) { free(z[i]); } for (int i=1;i<=L;++i) free(a[i]); free(a); free(z);
+    return loss;
+}
+
+static int save_model_to_file(const MLPModel* model, const char* model_path) {
+    FILE* fp = fopen(model_path, "wb");
+    if (!fp) return -1;
+    // Magic + version
+    unsigned int magic = MODEL_MAGIC_NUMBER;
+    unsigned char version = MODEL_FORMAT_VERSION;
+    fwrite(&magic, sizeof(magic), 1, fp);
+    fwrite(&version, sizeof(version), 1, fp);
+
+    // Build JSON metadata
+    cJSON* root = cJSON_CreateObject();
+    cJSON* arch = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "architecture", arch);
+    cJSON_AddNumberToObject(arch, "input_neurons", model->arch.input_neurons);
+    cJSON_AddNumberToObject(arch, "output_neurons", model->arch.output_neurons);
+    cJSON_AddStringToObject(root, "data_precision", "float");
+
+    // Hidden layers
+    cJSON* hidden = cJSON_CreateArray();
+    for (int i = 0; i < model->arch.num_hidden_layers; ++i) {
+        cJSON* hl = cJSON_CreateObject();
+        cJSON_AddNumberToObject(hl, "neurons", model->arch.hidden_neurons_per_layer[i]);
+        cJSON_AddStringToObject(hl, "activation", activation_to_string(model->layers[i].activation_function));
+        cJSON_AddItemToArray(hidden, hl);
+    }
+    cJSON_AddItemToObject(arch, "hidden_layers", hidden);
+    cJSON_AddStringToObject(arch, "output_activation", activation_to_string(model->layers[model->arch.num_hidden_layers].activation_function));
+
+    char* json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json_str) { fclose(fp); return -1; }
+    unsigned int len = (unsigned int)strlen(json_str);
+    fwrite(&len, sizeof(len), 1, fp);
+    fwrite(json_str, 1, len, fp);
+    free(json_str);
+
+    // Write weights and biases
+    int prev = model->arch.input_neurons;
+    for (int i = 0; i < model->num_weight_sets; ++i) {
+        int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
+                                                       : model->arch.output_neurons;
+        long n = (long)prev * curr;
+        fwrite(model->weights[i], sizeof(float), n, fp);
+        fwrite(model->biases[i], sizeof(float), curr, fp);
+        prev = curr;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+static float cosine_similarity(const float* a, const float* b, int n) {
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (int i = 0; i < n; ++i) { dot += (double)a[i]*b[i]; na += (double)a[i]*a[i]; nb += (double)b[i]*b[i]; }
+    if (na <= 0.0 || nb <= 0.0) return 0.0f;
+    double cs = dot / (sqrt(na) * sqrt(nb));
+    if (cs < -1.0) cs = -1.0; if (cs > 1.0) cs = 1.0;
+    return (float)cs;
+}
+
+static int write_pgm(const char* path, int w, int h, const unsigned char* data) {
+    FILE* fp = fopen(path, "wb");
+    if (!fp) return -1;
+    fprintf(fp, "P5\n%d %d\n255\n", w, h);
+    fwrite(data, 1, (size_t)(w*h), fp);
+    fclose(fp);
+    return 0;
+}
+
+// -------- Public API Extensions --------
+
+NN_Model* nn_model_create(int input_neurons,
+                          const int* hidden_sizes, int num_hidden,
+                          int output_neurons,
+                          const ActivationFunction* hidden_activations,
+                          ActivationFunction output_activation) {
+    NN_Model* m = (NN_Model*)calloc(1, sizeof(NN_Model));
+    if (!m) return NULL;
+    MLPModel* model = &m->impl;
+    model->arch.input_neurons = input_neurons;
+    model->arch.output_neurons = output_neurons;
+    model->arch.num_hidden_layers = num_hidden;
+    model->arch.hidden_neurons_per_layer = NULL;
+    if (num_hidden > 0) {
+        model->arch.hidden_neurons_per_layer = (int*)malloc(sizeof(int)*num_hidden);
+        if (!model->arch.hidden_neurons_per_layer) { nn_model_free(m); return NULL; }
+        for (int i=0;i<num_hidden;++i) model->arch.hidden_neurons_per_layer[i] = hidden_sizes[i];
+    }
+    model->num_weight_sets = num_hidden + 1;
+    model->weights = (float**)calloc(model->num_weight_sets, sizeof(float*));
+    model->biases  = (float**)calloc(model->num_weight_sets, sizeof(float*));
+    model->layers  = (_NoodleNetLayer*)calloc(model->num_weight_sets, sizeof(_NoodleNetLayer));
+    if (!model->weights || !model->biases || !model->layers) { nn_model_free(m); return NULL; }
+
+    int prev = input_neurons;
+    for (int i = 0; i < model->num_weight_sets; ++i) {
+        int curr = (i < num_hidden) ? hidden_sizes[i] : output_neurons;
+        long n = (long)prev * curr;
+        model->weights[i] = (float*)malloc(sizeof(float)*n);
+        model->biases[i]  = (float*)malloc(sizeof(float)*curr);
+        if (!model->weights[i] || !model->biases[i]) { nn_model_free(m); return NULL; }
+        prev = curr;
+    }
+    for (int i=0;i<num_hidden;++i) set_activation_functions(&model->layers[i], hidden_activations ? hidden_activations[i] : NN_ACTIVATION_FUNCTION_SIGMOID);
+    set_activation_functions(&model->layers[num_hidden], output_activation);
+    init_random_weights(model);
+    // Initialize optimizer defaults and allocate state arrays
+    model->optimizer = NN_OPTIMIZER_SGD;
+    model->beta1 = 0.9f; model->beta2 = 0.999f; model->epsilon = 1e-8f; model->adam_timestep = 0;
+    model->m_weights = (float**)calloc(model->num_weight_sets, sizeof(float*));
+    model->v_weights = (float**)calloc(model->num_weight_sets, sizeof(float*));
+    model->m_biases  = (float**)calloc(model->arch.num_hidden_layers + 1, sizeof(float*));
+    model->v_biases  = (float**)calloc(model->arch.num_hidden_layers + 1, sizeof(float*));
+    if (!model->m_weights || !model->v_weights || !model->m_biases || !model->v_biases) { nn_model_free(m); return NULL; }
+    int prev_in = input_neurons;
+    for (int i=0;i<model->num_weight_sets;++i) {
+        int curr = (i < num_hidden) ? hidden_sizes[i] : output_neurons;
+        long n = (long)prev_in * curr;
+        model->m_weights[i] = (float*)calloc(n, sizeof(float));
+        model->v_weights[i] = (float*)calloc(n, sizeof(float));
+        if (!model->m_weights[i] || !model->v_weights[i]) { nn_model_free(m); return NULL; }
+        prev_in = curr;
+    }
+    for (int i=0;i<model->arch.num_hidden_layers+1;++i) {
+        int len = (i<model->arch.num_hidden_layers)? model->arch.hidden_neurons_per_layer[i] : model->arch.output_neurons;
+        model->m_biases[i] = (float*)calloc(len, sizeof(float));
+        model->v_biases[i] = (float*)calloc(len, sizeof(float));
+        if (!model->m_biases[i] || !model->v_biases[i]) { nn_model_free(m); return NULL; }
+    }
+    return m;
+}
+
+NN_Model* nn_model_load(const char* model_path) {
+    NN_Model* m = (NN_Model*)calloc(1, sizeof(NN_Model));
+    if (!m) return NULL;
+    if (load_model_from_file(model_path, &m->impl) != 0) { free(m); return NULL; }
+    // Initialize optimizer state arrays for a loaded model
+    MLPModel* model = &m->impl;
+    model->optimizer = NN_OPTIMIZER_SGD;
+    model->beta1 = 0.9f; model->beta2 = 0.999f; model->epsilon = 1e-8f; model->adam_timestep = 0;
+    model->m_weights = (float**)calloc(model->num_weight_sets, sizeof(float*));
+    model->v_weights = (float**)calloc(model->num_weight_sets, sizeof(float*));
+    model->m_biases  = (float**)calloc(model->arch.num_hidden_layers + 1, sizeof(float*));
+    model->v_biases  = (float**)calloc(model->arch.num_hidden_layers + 1, sizeof(float*));
+    if (!model->m_weights || !model->v_weights || !model->m_biases || !model->v_biases) { nn_model_free(m); return NULL; }
+    int prev_in = model->arch.input_neurons;
+    for (int i=0;i<model->num_weight_sets;++i) {
+        int curr = (i<model->arch.num_hidden_layers)? model->arch.hidden_neurons_per_layer[i] : model->arch.output_neurons;
+        long n = (long)prev_in * curr;
+        model->m_weights[i] = (float*)calloc(n, sizeof(float));
+        model->v_weights[i] = (float*)calloc(n, sizeof(float));
+        if (!model->m_weights[i] || !model->v_weights[i]) { nn_model_free(m); return NULL; }
+        prev_in = curr;
+    }
+    for (int i=0;i<model->arch.num_hidden_layers+1;++i) {
+        int len = (i<model->arch.num_hidden_layers)? model->arch.hidden_neurons_per_layer[i] : model->arch.output_neurons;
+        model->m_biases[i] = (float*)calloc(len, sizeof(float));
+        model->v_biases[i] = (float*)calloc(len, sizeof(float));
+        if (!model->m_biases[i] || !model->v_biases[i]) { nn_model_free(m); return NULL; }
+    }
+    return m;
+}
+
+int nn_model_save(const NN_Model* model, const char* model_path) {
+    if (!model) return -1;
+    return save_model_to_file(&model->impl, model_path);
+}
+
+void nn_model_free(NN_Model* model) {
+    if (!model) return;
+    free_mlp_model(&model->impl);
+    free(model);
+}
+
+int nn_model_num_hidden(const NN_Model* model) { return model ? model->impl.arch.num_hidden_layers : -1; }
+int nn_model_hidden_size(const NN_Model* model, int layer_index) {
+    if (!model) return -1;
+    if (layer_index < 0 || layer_index >= model->impl.arch.num_hidden_layers) return -1;
+    return model->impl.arch.hidden_neurons_per_layer[layer_index];
+}
+int nn_model_input_size(const NN_Model* model) { return model ? model->impl.arch.input_neurons : -1; }
+int nn_model_output_size(const NN_Model* model) { return model ? model->impl.arch.output_neurons : -1; }
+ActivationFunction nn_model_hidden_activation(const NN_Model* model, int layer_index) {
+    if (!model) return NN_ACTIVATION_FUNCTION_SIGMOID;
+    if (layer_index < 0 || layer_index >= model->impl.arch.num_hidden_layers) return NN_ACTIVATION_FUNCTION_SIGMOID;
+    return model->impl.layers[layer_index].activation_function;
+}
+ActivationFunction nn_model_output_activation(const NN_Model* model) {
+    if (!model) return NN_ACTIVATION_FUNCTION_SIGMOID;
+    return model->impl.layers[model->impl.arch.num_hidden_layers].activation_function;
+}
+
+int nn_model_predict_image(const NN_Model* model, const char* image_path, float* out_prob) {
+    if (!model || !out_prob) return -1;
+    float* input = (float*)malloc(sizeof(float) * EXPECTED_INPUT_NEURONS);
+    if (!input) return -1;
+    if (load_and_process_image(image_path, input) != 0) { free(input); return -1; }
+    float p = perform_forward_pass(&model->impl, input);
+    free(input);
+    if (isnan(p) || isinf(p)) return -1;
+    if (p < 0.0f) p = 0.0f; if (p > 1.0f) p = 1.0f;
+    *out_prob = p;
+    return 0;
+}
+
+int nn_num_weight_layers(const NN_Model* model) {
+    if (!model) return -1;
+    return model->impl.num_weight_sets;
+}
+
+int nn_layer_dims(const NN_Model* model, int layer_index, int* out_in, int* out_out) {
+    if (!model || layer_index < 0 || layer_index >= model->impl.num_weight_sets) return -1;
+    int in = (layer_index == 0) ? model->impl.arch.input_neurons
+                                : model->impl.arch.hidden_neurons_per_layer[layer_index - 1];
+    int out = (layer_index < model->impl.arch.num_hidden_layers) ? model->impl.arch.hidden_neurons_per_layer[layer_index]
+                                                                 : model->impl.arch.output_neurons;
+    if (out_in) *out_in = in; if (out_out) *out_out = out; return 0;
+}
+
+int nn_get_weights(const NN_Model* model, int layer_index, float* out, size_t out_len) {
+    if (!model || !out) return -1;
+    int in=0, outn=0; if (nn_layer_dims(model, layer_index, &in, &outn) != 0) return -1;
+    size_t need = (size_t)in * (size_t)outn;
+    if (out_len < need) return -1;
+    const float* W = model->impl.weights[layer_index];
+    memcpy(out, W, need * sizeof(float));
+    return 0;
+}
+
+int nn_get_biases(const NN_Model* model, int layer_index, float* out, size_t out_len) {
+    if (!model || !out) return -1;
+    int in=0, outn=0; if (nn_layer_dims(model, layer_index, &in, &outn) != 0) return -1;
+    if (out_len < (size_t)outn) return -1;
+    const float* B = model->impl.biases[layer_index];
+    memcpy(out, B, (size_t)outn * sizeof(float));
+    return 0;
+}
+
+int nn_compute_activations_from_image(const NN_Model* model, const char* image_path, int layer_index, float* out, size_t out_len) {
+    if (!model || !image_path || !out) return -1;
+    int L = model->impl.num_weight_sets;
+    if (layer_index < 0 || layer_index > L) return -1;
+    // Determine expected length
+    int expected_len = (layer_index == 0) ? model->impl.arch.input_neurons
+                        : (layer_index < model->impl.arch.num_hidden_layers ? model->impl.arch.hidden_neurons_per_layer[layer_index]
+                                                                           : model->impl.arch.output_neurons);
+    if (out_len < (size_t)expected_len) return -1;
+    float* x = (float*)malloc(sizeof(float) * EXPECTED_INPUT_NEURONS);
+    if (!x) return -1;
+    if (load_and_process_image(image_path, x) != 0) { free(x); return -1; }
+    if (layer_index == 0) {
+        memcpy(out, x, (size_t)expected_len * sizeof(float));
+        free(x); return 0;
+    }
+    // Forward until target layer
+    int prev = model->impl.arch.input_neurons;
+    float* a_prev = x; // owned
+    for (int i=0;i<layer_index;i++) {
+        int curr = (i < model->impl.arch.num_hidden_layers) ? model->impl.arch.hidden_neurons_per_layer[i]
+                                                            : model->impl.arch.output_neurons;
+        float* a_curr = (float*)malloc(sizeof(float) * curr);
+        if (!a_curr) { free(a_prev); return -1; }
+        const float* Wi = model->impl.weights[i]; const float* bi = model->impl.biases[i];
+        for (int r=0;r<curr;++r) {
+            double sum = bi[r]; const float* wrow = Wi + (long)r * prev; for (int c=0;c<prev;++c) sum += wrow[c]*a_prev[c];
+            a_curr[r] = model->impl.layers[i].activate((float)sum);
+        }
+        if (i == layer_index - 1) {
+            memcpy(out, a_curr, (size_t)expected_len * sizeof(float));
+            free(a_curr); free(a_prev); return 0;
+        }
+        free(a_prev); a_prev = a_curr; prev = curr;
+    }
+    free(a_prev);
+    return -1;
+}
+
+int nn_compute_pre_activations_from_image(const NN_Model* model, const char* image_path, int layer_index, float* out, size_t out_len) {
+    if (!model || !image_path || !out) return -1;
+    int L = model->impl.num_weight_sets;
+    if (layer_index < 1 || layer_index > L) return -1;
+    int expected_len = (layer_index < model->impl.arch.num_hidden_layers) ? model->impl.arch.hidden_neurons_per_layer[layer_index]
+                                                                          : model->impl.arch.output_neurons;
+    // Correction: for z at layer_index, size equals that layer's neuron count
+    expected_len = (layer_index <= model->impl.arch.num_hidden_layers) ? model->impl.arch.hidden_neurons_per_layer[layer_index-1]
+                                                                      : model->impl.arch.output_neurons;
+    if (out_len < (size_t)expected_len) return -1;
+    float* x = (float*)malloc(sizeof(float) * EXPECTED_INPUT_NEURONS);
+    if (!x) return -1;
+    if (load_and_process_image(image_path, x) != 0) { free(x); return -1; }
+    int prev = model->impl.arch.input_neurons;
+    float* a_prev = x; // owned
+    for (int i=0;i<layer_index;i++) {
+        int curr = (i < model->impl.arch.num_hidden_layers) ? model->impl.arch.hidden_neurons_per_layer[i]
+                                                            : model->impl.arch.output_neurons;
+        float* z_curr = (float*)malloc(sizeof(float) * curr);
+        if (!z_curr) { free(a_prev); return -1; }
+        const float* Wi = model->impl.weights[i]; const float* bi = model->impl.biases[i];
+        for (int r=0;r<curr;++r) {
+            double sum = bi[r]; const float* wrow = Wi + (long)r * prev; for (int c=0;c<prev;++c) sum += wrow[c]*a_prev[c];
+            z_curr[r] = (float)sum;
+        }
+        if (i == layer_index - 1) {
+            memcpy(out, z_curr, (size_t)expected_len * sizeof(float));
+            free(z_curr); free(a_prev); return 0;
+        }
+        // Prepare next a_prev by applying activation to z
+        float* a_curr = (float*)malloc(sizeof(float) * curr);
+        if (!a_curr) { free(z_curr); free(a_prev); return -1; }
+        for (int r=0;r<curr;++r) a_curr[r] = model->impl.layers[i].activate(z_curr[r]);
+        free(z_curr);
+        free(a_prev); a_prev = a_curr; prev = curr;
+    }
+    free(a_prev);
+    return -1;
+}
+int nn_train_from_dirs(NN_Model* model,
+                       const char* pos_dir,
+                       const char* neg_dir,
+                       const char* val_dir,
+                       int steps,
+                       int batch_size,
+                       float learning_rate,
+                       float l1_lambda,
+                       float l2_lambda,
+                       float* out_last_loss,
+                       float* out_val_loss) {
+    if (!model || !pos_dir || steps <= 0 || batch_size <= 0) return -1;
+    char** pos_list=NULL; int pos_count=0;
+    char** neg_list=NULL; int neg_count=0;
+    if (list_images_in_dir(pos_dir, &pos_list, &pos_count) != 0 || pos_count == 0) { free_string_array(pos_list, pos_count); return -1; }
+    if (neg_dir && list_images_in_dir(neg_dir, &neg_list, &neg_count) != 0) { free_string_array(pos_list, pos_count); free_string_array(neg_list, neg_count); return -1; }
+    int total = pos_count + neg_count;
+    float* x = (float*)malloc(sizeof(float) * EXPECTED_INPUT_NEURONS);
+    if (!x) { free_string_array(pos_list, pos_count); free_string_array(neg_list, neg_count); return -1; }
+    float last_loss = 0.0f;
+    int idx = 0;
+    // Optional validation sets: expect val_dir/pos and val_dir/neg
+    char **val_pos_list=NULL, **val_neg_list=NULL; int val_pos_count=0, val_neg_count=0;
+    if (val_dir) {
+        char path_pos[4096]; char path_neg[4096];
+        snprintf(path_pos,sizeof(path_pos),"%s/pos", val_dir);
+        snprintf(path_neg,sizeof(path_neg),"%s/neg", val_dir);
+        if (list_images_in_dir(path_pos, &val_pos_list, &val_pos_count) != 0) { val_pos_list=NULL; val_pos_count=0; }
+        if (list_images_in_dir(path_neg, &val_neg_list, &val_neg_count) != 0) { val_neg_list=NULL; val_neg_count=0; }
+        // If neither subdir exists or empty, fall back to treating val_dir as positives-only
+        if (val_pos_count==0 && val_neg_count==0) {
+            (void)list_images_in_dir(val_dir, &val_pos_list, &val_pos_count);
+        }
+    }
+    for (int step = 0; step < steps; ++step) {
+        float batch_loss = 0.0f; int batch_items = 0;
+        for (int b = 0; b < batch_size; ++b) {
+            // Round-robin through positives then negatives
+            int use_pos = (idx % (total)) < pos_count;
+            const char* path = NULL; float y = 0.0f;
+            if (use_pos) { path = pos_list[idx % pos_count]; y = 1.0f; }
+            else { int j = (idx - pos_count) % (neg_count > 0 ? neg_count : 1); if (neg_count > 0) path = neg_list[j]; else path = pos_list[idx % pos_count]; y = 0.0f; }
+            idx++;
+            if (load_and_process_image(path, x) != 0) continue;
+            float loss = train_one_example(&model->impl, x, y, learning_rate, l1_lambda, l2_lambda);
+            if (!isnan(loss) && !isinf(loss)) { batch_loss += loss; batch_items++; }
+        }
+        if (batch_items > 0) last_loss = batch_loss / batch_items;
+        // Per-epoch validation loss (optional)
+        if (val_dir && out_val_loss) {
+            float vloss_sum = 0.0f; int vcount = 0;
+            // Evaluate positives
+            float* vx = (float*)malloc(sizeof(float) * EXPECTED_INPUT_NEURONS);
+            if (vx) {
+                int max_samples = 128;
+                if (val_pos_count > 0) {
+                    int stride = (val_pos_count > max_samples) ? (val_pos_count / max_samples) : 1;
+                    for (int i=0;i<val_pos_count;i+=stride) {
+                        if (load_and_process_image(val_pos_list[i], vx) != 0) continue;
+                        float l = compute_loss_only(&model->impl, vx, 1.0f);
+                        if (!isnan(l) && !isinf(l)) { vloss_sum += l; vcount++; }
+                        if (vcount >= max_samples) break;
+                    }
+                }
+                if (val_neg_count > 0) {
+                    int stride = (val_neg_count > max_samples) ? (val_neg_count / max_samples) : 1;
+                    for (int i=0;i<val_neg_count;i+=stride) {
+                        if (load_and_process_image(val_neg_list[i], vx) != 0) continue;
+                        float l = compute_loss_only(&model->impl, vx, 0.0f);
+                        if (!isnan(l) && !isinf(l)) { vloss_sum += l; vcount++; }
+                        if (vcount >= 2*max_samples) break;
+                    }
+                }
+                // If only a flat val dir with unknown labels, treat as positives
+                if (val_pos_count>0 && val_neg_count==0) {
+                    // already handled above as positives
+                }
+                free(vx);
+            }
+            if (vcount > 0) *out_val_loss = vloss_sum / vcount;
+        }
+    }
+    free(x);
+    free_string_array(pos_list, pos_count);
+    free_string_array(neg_list, neg_count);
+    free_string_array(val_pos_list, val_pos_count);
+    free_string_array(val_neg_list, val_neg_count);
+    if (out_last_loss) *out_last_loss = last_loss;
+    return 0;
+}
+
+// Down/upsample a row of length src_len into dst_len using simple bin-averaging (down) or nearest (up)
+static void resample_row_uniform(const float* src, int src_len, float* dst, int dst_len) {
+    if (dst_len <= 0 || src_len <= 0) return;
+    if (src_len == dst_len) { memcpy(dst, src, sizeof(float) * (size_t)dst_len); return; }
+    if (src_len > dst_len) {
+        for (int j = 0; j < dst_len; ++j) {
+            long start = ((long)j * (long)src_len) / (long)dst_len;
+            long end   = ((long)(j + 1) * (long)src_len) / (long)dst_len;
+            if (end <= start) end = start + 1;
+            if (end > src_len) end = src_len;
+            double sum = 0.0; long cnt = 0;
+            for (long k = start; k < end; ++k) { sum += src[k]; cnt++; }
+            dst[j] = (cnt > 0) ? (float)(sum / (double)cnt) : 0.0f;
+        }
+    } else { // upsample: nearest neighbor
+        for (int j = 0; j < dst_len; ++j) {
+            long idx = ((long)j * (long)src_len) / (long)dst_len;
+            if (idx >= src_len) idx = src_len - 1;
+            dst[j] = src[idx];
+        }
+    }
+}
+
+// Mapping helpers
+static void map_to_bytes_minmax(const float* in, unsigned char* out, long n, float vmin, float vmax) {
+    if (vmax > vmin) {
+        double scale = 255.0 / (double)(vmax - vmin);
+        double bias  = - (double)vmin * scale;
+        for (long t = 0; t < n; ++t) {
+            int iv = (int)((double)in[t] * scale + bias + 0.5);
+            if (iv < 0) iv = 0; if (iv > 255) iv = 255; out[t] = (unsigned char)iv;
+        }
+    } else {
+        memset(out, 127, (size_t)n);
+    }
+}
+
+static void map_to_bytes_symmetric_zero(const float* in, unsigned char* out, long n) {
+    float maxabs = 0.0f;
+    for (long t = 0; t < n; ++t) { float a = fabsf(in[t]); if (a > maxabs) maxabs = a; }
+    if (maxabs > 0.0f) {
+        double scale = 127.5 / (double)maxabs; // [-max,+max] -> [-127.5,+127.5]
+        for (long t = 0; t < n; ++t) {
+            int iv = (int)(in[t] * scale + 127.5 + 0.5);
+            if (iv < 0) iv = 0; if (iv > 255) iv = 255; out[t] = (unsigned char)iv;
+        }
+    } else {
+        memset(out, 127, (size_t)n);
+    }
+}
+
+int nn_export_layer_visualizations_ex(const NN_Model* model, const char* output_dir, const NN_VisOptions* options) {
+    if (!model || !output_dir) return -1;
+    struct stat st; if (stat(output_dir, &st) != 0) { (void)mkdir(output_dir, 0755); }
+    NN_VisMode mode = NN_VIS_MODE_WEIGHTS;
+    NN_VisScale scale = NN_VIS_SCALE_MINMAX;
+    int include_bias = 0, include_stats = 0;
+    if (options) { mode = options->mode; scale = options->scale; include_bias = options->include_bias; include_stats = options->include_stats; }
+    int prev = model->impl.arch.input_neurons;
+    for (int i = 0; i < model->impl.arch.num_hidden_layers; ++i) {
+        int curr = model->impl.arch.hidden_neurons_per_layer[i];
+        const float* Wi = model->impl.weights[i];
+        unsigned char* img = NULL;
+        float* work = NULL;
+        long workN = 0;
+        float minv=0.0f, maxv=0.0f;
+
+        if (mode == NN_VIS_MODE_WEIGHTS) {
+            workN = (long)curr * (long)curr;
+            work = (float*)malloc(sizeof(float) * (size_t)workN);
+            if (!work) return -1;
+            for (int r = 0; r < curr; ++r) {
+                const float* wrow = Wi + (long)r * prev;
+                resample_row_uniform(wrow, prev, work + (size_t)r * (size_t)curr, curr);
+            }
+            minv = maxv = work[0];
+            for (long t = 1; t < workN; ++t) { float v=work[t]; if (v<minv) minv=v; if (v>maxv) maxv=v; }
+            img = (unsigned char*)malloc((size_t)workN);
+            if (!img) { free(work); return -1; }
+            if (scale == NN_VIS_SCALE_MINMAX) map_to_bytes_minmax(work, img, workN, minv, maxv);
+            else map_to_bytes_symmetric_zero(work, img, workN);
+        } else { // heatmap
+            const int max_samples = 1024;
+            int use_exact = (prev <= 8192);
+            int samples = use_exact ? prev : ((prev < max_samples) ? prev : max_samples);
+            int* idx = NULL;
+            if (!use_exact) {
+                idx = (int*)malloc(sizeof(int) * (size_t)samples);
+                if (!idx) return -1;
+                for (int k = 0; k < samples; ++k) {
+                    long pos = ((long)k * (long)prev) / (long)samples;
+                    if (pos >= prev) pos = prev - 1; idx[k] = (int)pos;
+                }
+            }
+            float* proj = use_exact ? NULL : (float*)malloc(sizeof(float) * (size_t)curr * (size_t)samples);
+            double* norms = (double*)malloc(sizeof(double) * (size_t)curr);
+            if (!norms || (!use_exact && !proj)) { free(idx); free(proj); free(norms); return -1; }
+            for (int r = 0; r < curr; ++r) {
+                const float* wr = Wi + (long)r * prev;
+                double nrm = 0.0;
+                if (use_exact) {
+                    for (int k = 0; k < samples; ++k) { float v = wr[k]; nrm += (double)v * v; }
+                } else {
+                    float* rowp = proj + (size_t)r * (size_t)samples;
+                    for (int k = 0; k < samples; ++k) { float v = wr[idx[k]]; rowp[k] = v; nrm += (double)v * v; }
+                }
+                norms[r] = sqrt(nrm);
+            }
+            workN = (long)curr * (long)curr;
+            work = (float*)malloc(sizeof(float) * (size_t)workN);
+            if (!work) { free(idx); free(proj); free(norms); return -1; }
+            for (long t=0;t<workN;++t) work[t]=0.0f;
+            minv=1.0f; maxv=-1.0f;
+            for (int r = 0; r < curr; ++r) {
+                work[(size_t)r * curr + r] = 1.0f;
+                const float* pr = use_exact ? (Wi + (long)r * prev) : (proj + (size_t)r * (size_t)samples);
+                double nr = norms[r];
+                for (int c = r+1; c < curr; ++c) {
+                    const float* pc = use_exact ? (Wi + (long)c * prev) : (proj + (size_t)c * (size_t)samples);
+                    double nc = norms[c]; double dot=0.0;
+                    for (int k=0;k<samples;++k) dot += (double)pr[k] * (double)pc[k];
+                    float cs = 0.0f;
+                    if (nr>0.0 && nc>0.0) { double v = dot/(nr*nc); if (v<-1.0) v=-1.0; if (v>1.0) v=1.0; cs=(float)v; }
+                    work[(size_t)r * curr + c] = cs; work[(size_t)c * curr + r] = cs;
+                    if (cs<minv && r!=c) minv=cs; if (cs>maxv && r!=c) maxv=cs;
+                }
+            }
+            if (idx) free(idx); if (proj) free(proj); free(norms);
+            img = (unsigned char*)malloc((size_t)workN);
+            if (!img) { free(work); return -1; }
+            if (scale == NN_VIS_SCALE_MINMAX) {
+                if (maxv > minv) map_to_bytes_minmax(work, img, workN, minv, maxv);
+                else map_to_bytes_symmetric_zero(work, img, workN);
+            } else {
+                map_to_bytes_symmetric_zero(work, img, workN);
+            }
+            for (int d=0; d<curr; ++d) img[(size_t)d * curr + d] = 255;
+        }
+
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/layer_%d.pgm", output_dir, i+1);
+        int rc = write_pgm(path, curr, curr, img);
+        free(img);
+        if (include_stats) {
+            double sum=0.0, sum2=0.0; for (long t=0;t<workN;++t){ double v=work[t]; sum+=v; sum2+=v*v; }
+            double mean = sum/(double)workN; double var = (sum2/(double)workN) - mean*mean; if (var<0) var=0; double std = sqrt(var);
+            char spath[4096]; snprintf(spath,sizeof(spath),"%s/layer_%d_stats.txt", output_dir, i+1);
+            FILE* sf = fopen(spath,"w"); if (sf){ fprintf(sf,"min=%.9g\nmax=%.9g\nmean=%.9g\nstd=%.9g\n", (double)minv, (double)maxv, mean, std); fclose(sf);} }
+        free(work);
+        if (include_bias) {
+            const float* b = model->impl.biases[i];
+            float bmin=b[0], bmax=b[0]; for (int j=1;j<curr;++j){ float v=b[j]; if(v<bmin) bmin=v; if(v>bmax) bmax=v; }
+            unsigned char* brow = (unsigned char*)malloc((size_t)curr);
+            if (brow) {
+                if (scale == NN_VIS_SCALE_MINMAX) map_to_bytes_minmax(b, brow, curr, bmin, bmax);
+                else map_to_bytes_symmetric_zero(b, brow, curr);
+                char bpath[4096]; snprintf(bpath,sizeof(bpath),"%s/layer_%d_biases.pgm", output_dir, i+1);
+                (void)write_pgm(bpath, curr, 1, brow);
+                free(brow);
+                if (include_stats) {
+                    double s=0.0,s2=0.0; for (int j=0;j<curr;++j){ double v=b[j]; s+=v; s2+=v*v; } double mean=s/(double)curr; double var=(s2/(double)curr)-mean*mean; if (var<0)var=0; double std=sqrt(var);
+                    char bsp[4096]; snprintf(bsp,sizeof(bsp),"%s/layer_%d_biases_stats.txt", output_dir, i+1);
+                    FILE* sf=fopen(bsp,"w"); if (sf){ fprintf(sf,"min=%.9g\nmax=%.9g\nmean=%.9g\nstd=%.9g\n", (double)bmin,(double)bmax,mean,std); fclose(sf);} }
+            }
+        }
+        if (rc != 0) return -1;
+        prev = curr;
+    }
+    return 0;
+}
+
+int nn_export_layer_visualizations(const NN_Model* model, const char* output_dir) {
+    NN_VisOptions opts; opts.mode = NN_VIS_MODE_WEIGHTS; opts.scale = NN_VIS_SCALE_MINMAX; opts.include_bias = 0; opts.include_stats = 0;
+    return nn_export_layer_visualizations_ex(model, output_dir, &opts);
+}
+
+// replaced by nn_export_layer_visualizations_ex wrapper below
+
+int nn_evaluate_dirs(const NN_Model* model,
+                     const char* pos_dir,
+                     const char* neg_dir,
+                     int* true_pos,
+                     int* true_neg,
+                     int* false_pos,
+                     int* false_neg,
+                     float* out_accuracy) {
+    if (!model) return -1;
+    int tp=0, tn=0, fp=0, fn=0;
+    char** pos_list=NULL; int pos_count=0;
+    char** neg_list=NULL; int neg_count=0;
+    if (pos_dir && list_images_in_dir(pos_dir,&pos_list,&pos_count)!=0) { pos_list=NULL; pos_count=0; }
+    if (neg_dir && list_images_in_dir(neg_dir,&neg_list,&neg_count)!=0) { neg_list=NULL; neg_count=0; }
+    float* x = (float*)malloc(sizeof(float) * EXPECTED_INPUT_NEURONS);
+    if (!x) { free_string_array(pos_list,pos_count); free_string_array(neg_list,neg_count); return -1; }
+    for (int i=0;i<pos_count;++i) {
+        if (load_and_process_image(pos_list[i], x) != 0) continue;
+        float p = perform_forward_pass(&model->impl, x);
+        if (p>0.5f) tp++; else fn++;
+    }
+    for (int i=0;i<neg_count;++i) {
+        if (load_and_process_image(neg_list[i], x) != 0) continue;
+        float p = perform_forward_pass(&model->impl, x);
+        if (p>0.5f) fp++; else tn++;
+    }
+    free(x);
+    free_string_array(pos_list,pos_count);
+    free_string_array(neg_list,neg_count);
+    int total = tp+tn+fp+fn;
+    if (true_pos) *true_pos = tp;
+    if (true_neg) *true_neg = tn;
+    if (false_pos) *false_pos = fp;
+    if (false_neg) *false_neg = fn;
+    if (out_accuracy) *out_accuracy = (total>0)? ((float)(tp+tn)/(float)total) : 0.0f;
+    return 0;
+}
+
 static float perform_forward_pass(const MLPModel* model, const float* input_data) {
     float* current_activations = (float*)input_data; // Initially points to input_data
     float* next_activations_buffer = NULL; // To store activations of the next layer
@@ -715,4 +1642,21 @@ static float perform_forward_pass(const MLPModel* model, const float* input_data
     }
 
     return final_prediction;
+}
+
+// ---- Optimizer configuration ----
+int nn_model_set_optimizer(NN_Model* model, NN_Optimizer opt, float beta1, float beta2, float epsilon) {
+    if (!model) return -1;
+    model->impl.optimizer = opt;
+    if (opt == NN_OPTIMIZER_RMSPROP || opt == NN_OPTIMIZER_ADAM) {
+        if (beta1 <= 0.0f || beta1 >= 1.0f) beta1 = 0.9f;
+        if (beta2 <= 0.0f || beta2 >= 1.0f) beta2 = 0.999f;
+        if (epsilon <= 0.0f) epsilon = 1e-8f;
+    }
+    model->impl.beta1 = beta1;
+    model->impl.beta2 = beta2;
+    model->impl.epsilon = epsilon;
+    // Reset timestep when switching optimizers
+    model->impl.adam_timestep = 0;
+    return 0;
 }
