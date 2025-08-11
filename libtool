@@ -47,7 +47,7 @@ build_libtool_libs=yes
 build_old_libs=yes
 
 # What type of objects to build.
-pic_mode=default
+pic_mode=yes
 
 # Whether or not to optimize for fast installation.
 fast_install=needless
@@ -66,13 +66,13 @@ PATH_SEPARATOR=":"
 
 # The host system.
 host_alias=
-host=aarch64-apple-darwin24.5.0
-host_os=darwin24.5.0
+host=aarch64-apple-darwin25.0.0
+host_os=darwin25.0.0
 
 # The build system.
 build_alias=
-build=aarch64-apple-darwin24.5.0
-build_os=darwin24.5.0
+build=aarch64-apple-darwin25.0.0
+build_os=darwin25.0.0
 
 # A sed program that does not truncate output.
 SED="/usr/local/bin/sed"
@@ -90,7 +90,7 @@ EGREP="/usr/local/bin/grep -E"
 FGREP="/usr/local/bin/grep -F"
 
 # A BSD- or MS-compatible name lister.
-NM="/usr/local/bin/nm"
+NM="/usr/local/bin/nm -B"
 
 # Whether we need soft or hard links.
 LN_S="ln -s"
@@ -123,7 +123,7 @@ to_tool_file_cmd=func_convert_file_noop
 FILECMD="file"
 
 # An object symbol dumper.
-OBJDUMP="/usr/local/bin/objdump"
+OBJDUMP="objdump"
 
 # Method to check whether dependent libraries are shared objects.
 deplibs_check_method="pass_all"
@@ -144,7 +144,7 @@ DLLTOOL="dlltool"
 sharedlib_from_linklib_cmd="printf %s\\n"
 
 # The archiver.
-AR="/usr/local/bin/ar"
+AR="ar"
 
 # Flags to create an archive (by configure).
 lt_ar_flags=cr
@@ -156,10 +156,10 @@ AR_FLAGS=${ARFLAGS-"$lt_ar_flags"}
 archiver_list_spec="@"
 
 # A symbol stripping program.
-STRIP="/usr/local/bin/strip"
+STRIP="strip"
 
 # Commands used to install an old-style archive.
-RANLIB="/usr/local/bin/ranlib"
+RANLIB="ranlib"
 old_postinstall_cmds="chmod 644 \$oldlib~\$RANLIB \$tool_oldlib"
 old_postuninstall_cmds=""
 
@@ -167,10 +167,10 @@ old_postuninstall_cmds=""
 lock_old_archive_extraction=yes
 
 # A C compiler.
-LTCC="/usr/local/bin/clang"
+LTCC="gcc"
 
 # LTCC compiler flags.
-LTCFLAGS="-I/usr/local/include -O3 -fno-stack-protector -fno-common -fPIC"
+LTCFLAGS="-g -O2"
 
 # Take the output of nm and produce a listing of raw symbols and C names.
 global_symbol_pipe="/usr/local/bin/sed -n -e 's/^.*[	 ]\\([ABCDGIRSTW][ABCDGIRSTW]*\\)[	 ][	 ]*_\\([_A-Za-z][_A-Za-z0-9]*\\)\$/\\1 _\\2 \\2/p' | /usr/local/bin/sed '/ __gnu_lto/d'"
@@ -218,10 +218,10 @@ DSYMUTIL="dsymutil"
 NMEDIT="nmedit"
 
 # Tool to manipulate fat objects and archives on Mac OS X.
-LIPO="/usr/local/bin/lipo"
+LIPO="lipo"
 
 # ldd/readelf like tool for Mach-O binaries on Mac OS X.
-OTOOL="/usr/local/bin/otool"
+OTOOL="otool"
 
 # ldd/readelf like tool for 64 bit Mach-O binaries on Mac OS X 10.4.
 OTOOL64=":"
@@ -287,7 +287,7 @@ finish_eval=""
 hardcode_into_libs=no
 
 # Compile-time system search path for libraries.
-sys_lib_search_path_spec="/usr/local/lib/clang/20  /usr/local/lib"
+sys_lib_search_path_spec="/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17  /usr/local/lib"
 
 # Detected run-time system search path for libraries.
 sys_lib_dlsearch_path_spec="/usr/local/lib /lib /usr/lib"
@@ -305,12 +305,12 @@ dlopen_self=unknown
 dlopen_self_static=unknown
 
 # Commands to strip libraries.
-old_striplib="/usr/local/bin/strip --strip-debug"
-striplib="/usr/local/bin/strip --strip-unneeded"
+old_striplib="strip --strip-debug"
+striplib="strip --strip-unneeded"
 
 
 # The linker used to build libraries.
-LD="/usr/local/bin/clang"
+LD="/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld"
 
 # How to create reloadable object files.
 reload_flag=" -r"
@@ -320,7 +320,7 @@ reload_cmds="\$LTCC \$LTCFLAGS -nostdlib \$wl-r -o \$output\$reload_objs"
 old_archive_cmds="\$AR \$AR_FLAGS \$oldlib\$oldobjs~\$RANLIB \$tool_oldlib"
 
 # A language specific compiler.
-CC="/usr/local/bin/clang"
+CC="gcc"
 
 # Is the compiler the GNU compiler?
 with_gcc=yes
@@ -12040,7 +12040,7 @@ build_old_libs=`case $build_libtool_libs in yes) echo no;; *) echo yes;; esac`
 # ### BEGIN LIBTOOL TAG CONFIG: CXX
 
 # The linker used to build libraries.
-LD="/usr/local/bin/clang"
+LD="/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld"
 
 # How to create reloadable object files.
 reload_flag=" -r"
@@ -12050,7 +12050,7 @@ reload_cmds="\$LTCC \$LTCFLAGS -nostdlib \$wl-r -o \$output\$reload_objs"
 old_archive_cmds="\$AR \$AR_FLAGS \$oldlib\$oldobjs~\$RANLIB \$tool_oldlib"
 
 # A language specific compiler.
-CC="/usr/local/bin/clang++"
+CC="g++"
 
 # Is the compiler the GNU compiler?
 with_gcc=yes

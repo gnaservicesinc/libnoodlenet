@@ -1416,8 +1416,8 @@ int nn_export_layer_visualizations_ex(const NN_Model* model, const char* output_
     struct stat st; if (stat(output_dir, &st) != 0) { (void)mkdir(output_dir, 0755); }
     NN_VisMode mode = NN_VIS_MODE_WEIGHTS;
     NN_VisScale scale = NN_VIS_SCALE_MINMAX;
-    int include_bias = 0, include_stats = 0;
-    if (options) { mode = options->mode; scale = options->scale; include_bias = options->include_bias; include_stats = options->include_stats; }
+    int include_bias = 0, include_stats = 0, raw_weights_full = 0;
+    if (options) { mode = options->mode; scale = options->scale; include_bias = options->include_bias; include_stats = options->include_stats; raw_weights_full = options->raw_weights_full; }
     int prev = model->impl.arch.input_neurons;
     for (int i = 0; i < model->impl.arch.num_hidden_layers; ++i) {
         int curr = model->impl.arch.hidden_neurons_per_layer[i];
@@ -1428,6 +1428,51 @@ int nn_export_layer_visualizations_ex(const NN_Model* model, const char* output_
         float minv=0.0f, maxv=0.0f;
 
         if (mode == NN_VIS_MODE_WEIGHTS) {
+            if (raw_weights_full) {
+                // Export raw weight matrix as non-square PGM: width=prev, height=curr
+                workN = (long)curr * (long)prev;
+                work = (float*)malloc(sizeof(float) * (size_t)workN);
+                if (!work) return -1;
+                for (int r=0; r<curr; ++r) {
+                    const float* wrow = Wi + (long)r * prev;
+                    memcpy(work + (size_t)r * (size_t)prev, wrow, sizeof(float) * (size_t)prev);
+                }
+                minv = maxv = work[0];
+                for (long t=1; t<workN; ++t) { float v=work[t]; if(v<minv) minv=v; if(v>maxv) maxv=v; }
+                img = (unsigned char*)malloc((size_t)workN);
+                if (!img) { free(work); return -1; }
+                if (scale == NN_VIS_SCALE_MINMAX) map_to_bytes_minmax(work, img, workN, minv, maxv);
+                else map_to_bytes_symmetric_zero(work, img, workN);
+                char path_raw[4096]; snprintf(path_raw,sizeof(path_raw),"%s/layer_%d_raw.pgm", output_dir, i+1);
+                int rc_raw = write_pgm(path_raw, prev, curr, img);
+                free(img);
+                if (include_stats) {
+                    double sum=0.0, sum2=0.0; for (long t=0;t<workN;++t){ double v=work[t]; sum+=v; sum2+=v*v; } double mean=sum/(double)workN; double var=(sum2/(double)workN)-mean*mean; if(var<0)var=0; double std=sqrt(var);
+                    char spath[4096]; snprintf(spath,sizeof(spath),"%s/layer_%d_raw_stats.txt", output_dir, i+1);
+                    FILE* sf=fopen(spath,"w"); if (sf){ fprintf(sf,"min=%.9g\nmax=%.9g\nmean=%.9g\nstd=%.9g\n", (double)minv, (double)maxv, mean, std); fclose(sf);} }
+                free(work);
+                if (rc_raw != 0) return -1;
+                // Continue to next layer without producing square image when raw requested
+                prev = curr;
+                // Also export biases if requested (handled below after work was freed; replicate minimal code)
+                if (include_bias) {
+                    const float* b = model->impl.biases[i];
+                    float bmin=b[0], bmax=b[0]; for (int j=1;j<curr;++j){ float v=b[j]; if(v<bmin) bmin=v; if(v>bmax) bmax=v; }
+                    unsigned char* brow = (unsigned char*)malloc((size_t)curr);
+                    if (brow) {
+                        if (scale == NN_VIS_SCALE_MINMAX) map_to_bytes_minmax(b, brow, curr, bmin, bmax);
+                        else map_to_bytes_symmetric_zero(b, brow, curr);
+                        char bpath[4096]; snprintf(bpath,sizeof(bpath),"%s/layer_%d_biases.pgm", output_dir, i+1);
+                        (void)write_pgm(bpath, curr, 1, brow);
+                        free(brow);
+                        if (include_stats) {
+                            double s=0.0,s2=0.0; for (int j=0;j<curr;++j){ double v=b[j]; s+=v; s2+=v*v; } double mean=s/(double)curr; double var=(s2/(double)curr)-mean*mean; if (var<0)var=0; double std=sqrt(var);
+                            char bsp[4096]; snprintf(bsp,sizeof(bsp),"%s/layer_%d_biases_stats.txt", output_dir, i+1);
+                            FILE* sf=fopen(bsp,"w"); if (sf){ fprintf(sf,"min=%.9g\nmax=%.9g\nmean=%.9g\nstd=%.9g\n", (double)bmin,(double)bmax,mean,std); fclose(sf);} }
+                    }
+                }
+                continue;
+            }
             workN = (long)curr * (long)curr;
             work = (float*)malloc(sizeof(float) * (size_t)workN);
             if (!work) return -1;

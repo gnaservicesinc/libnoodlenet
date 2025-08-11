@@ -45,6 +45,7 @@ typedef struct {
     NN_VisScale scale;         // min-max or symmetric zero-centered
     int include_bias;          // if nonzero, export biases as 1xN PGM per layer
     int include_stats;         // if nonzero, write stats text per layer
+    int raw_weights_full;      // if nonzero and mode==WEIGHTS, export raw (curr x prev) instead of square
 } NN_VisOptions;
 
 /**
