@@ -137,7 +137,8 @@ am__uninstall_files_from_dir = { \
 am__installdirs = "$(DESTDIR)$(libdir)" "$(DESTDIR)$(pkgconfigdir)" \
 	"$(DESTDIR)$(includedir)"
 LTLIBRARIES = $(lib_LTLIBRARIES)
-libnoodlenet_la_LIBADD =
+am__DEPENDENCIES_1 =
+libnoodlenet_la_DEPENDENCIES = $(am__DEPENDENCIES_1)
 am_libnoodlenet_la_OBJECTS = libnoodlenet_la-noodlenet.lo \
 	libnoodlenet_la-cJSON.lo
 libnoodlenet_la_OBJECTS = $(am_libnoodlenet_la_OBJECTS)
@@ -265,6 +266,7 @@ am__distuninstallcheck_listfiles = $(distuninstallcheck_listfiles) \
 distcleancheck_listfiles = \
   find . \( -type f -a \! \
             \( -name .nfs* -o -name .smb* -o -name .__afs* \) \) -print
+ACCELERATE_LIBS = @ACCELERATE_LIBS@
 ACLOCAL = @ACLOCAL@
 AMTAR = @AMTAR@
 AM_DEFAULT_VERBOSITY = @AM_DEFAULT_VERBOSITY@
@@ -396,8 +398,9 @@ lib_LTLIBRARIES = libnoodlenet.la libnoodlenet_cpp.la
 
 # C library
 libnoodlenet_la_SOURCES = noodlenet.c cJSON.c
-libnoodlenet_la_CFLAGS = -std=c11
+libnoodlenet_la_CFLAGS = -std=c11 -O3
 libnoodlenet_la_LDFLAGS = -version-info 0:0:0
+libnoodlenet_la_LIBADD = $(ACCELERATE_LIBS)
 
 # C++ library
 libnoodlenet_cpp_la_SOURCES = noodlenet.cpp

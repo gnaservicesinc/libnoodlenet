@@ -12,6 +12,17 @@
 #include <errno.h>
 #include <sys/stat.h>
 
+// Apple Accelerate (BLAS) for fast GEMV if available
+#if defined(__APPLE__)
+#  include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__)
+#  include <Accelerate/Accelerate.h>
+#  define NN_USE_ACCELERATE 1
+#else
+#  define NN_USE_ACCELERATE 0
+#endif
+
 // STB Image Loading Library (Single Header)
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -183,6 +194,10 @@ typedef struct {
     float** v_weights; // moments for Adam/RMSprop
     float** m_biases;
     float** v_biases;
+    // Scratch buffers to avoid per-sample malloc/free churn
+    float** scratch_a;     // a[1..L] (a[0] alias to input)
+    float** scratch_z;     // z[0..L-1]
+    float** scratch_delta; // delta[0..L-1]
     // Persisted metadata
     char* meta_pos_dir;
     char* meta_neg_dir;
@@ -222,6 +237,27 @@ static float compute_loss_only(MLPModel* model, const float* x, float y);
 static int save_model_to_file(const MLPModel* model, const char* model_path);
 static float cosine_similarity(const float* a, const float* b, int n);
 static int write_pgm(const char* path, int w, int h, const unsigned char* data);
+
+// Allocate scratch buffers matching the model architecture
+static int allocate_scratch(MLPModel* model) {
+    int L = model->num_weight_sets;
+    // arrays of pointers
+    model->scratch_a = (float**)calloc((size_t)L + 1, sizeof(float*)); // we use indices 1..L
+    model->scratch_z = (float**)calloc((size_t)L, sizeof(float*));
+    model->scratch_delta = (float**)calloc((size_t)L, sizeof(float*));
+    if (!model->scratch_a || !model->scratch_z || !model->scratch_delta) return -1;
+    int prev = model->arch.input_neurons;
+    for (int i = 0; i < L; ++i) {
+        int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
+                                                       : model->arch.output_neurons;
+        model->scratch_z[i] = (float*)malloc(sizeof(float) * (size_t)curr);
+        model->scratch_a[i+1] = (float*)malloc(sizeof(float) * (size_t)curr);
+        model->scratch_delta[i] = (float*)malloc(sizeof(float) * (size_t)curr);
+        if (!model->scratch_z[i] || !model->scratch_a[i+1] || !model->scratch_delta[i]) return -1;
+        prev = curr;
+    }
+    return 0;
+}
 
 // --- Public API Implementation ---
 int noodlenet_predict(const char* model_path, const char* image_path) {
@@ -303,6 +339,29 @@ static void free_mlp_model(MLPModel* model) {
     if (model->layers) {
         free(model->layers);
         model->layers = NULL;
+    }
+
+    // Free scratch buffers
+    if (model->scratch_a) {
+        for (int i = 1; i <= model->num_weight_sets; ++i) {
+            if (model->scratch_a[i]) free(model->scratch_a[i]);
+        }
+        free(model->scratch_a);
+        model->scratch_a = NULL;
+    }
+    if (model->scratch_z) {
+        for (int i = 0; i < model->num_weight_sets; ++i) {
+            if (model->scratch_z[i]) free(model->scratch_z[i]);
+        }
+        free(model->scratch_z);
+        model->scratch_z = NULL;
+    }
+    if (model->scratch_delta) {
+        for (int i = 0; i < model->num_weight_sets; ++i) {
+            if (model->scratch_delta[i]) free(model->scratch_delta[i]);
+        }
+        free(model->scratch_delta);
+        model->scratch_delta = NULL;
     }
 
     if (model->m_weights) {
@@ -841,74 +900,81 @@ static float train_one_example(MLPModel* model, const float* x, float y, float l
     if (model->optimizer == NN_OPTIMIZER_ADAM) {
         model->adam_timestep += 1;
     }
-    // Allocate activations and z's
-    float** a = (float**)calloc(L + 1, sizeof(float*)); // a[0]=input, a[L]=output
-    float** z = (float**)calloc(L, sizeof(float*));
-    float** delta = (float**)calloc(L, sizeof(float*));
-    if (!a || !z || !delta) { free(a); free(z); free(delta); return NAN; }
+
+    // Use preallocated scratch buffers
+    float** a = model->scratch_a;     // a[0] set to x below
+    float** z = model->scratch_z;
+    float** delta = model->scratch_delta;
+    if (!a || !z || !delta) return NAN;
 
     int prev = model->arch.input_neurons;
-    a[0] = (float*)x; // do not own
+    a[0] = (float*)x; // alias input
 
-    // Forward
+    // Forward: z = W*a + b; a = act(z)
     for (int i = 0; i < L; ++i) {
         int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
                                                        : model->arch.output_neurons;
-        z[i] = (float*)malloc(sizeof(float) * curr);
-        a[i+1] = (float*)malloc(sizeof(float) * curr);
-        if (!z[i] || !a[i+1]) goto oom;
-        // z = W * a_prev + b
         float* Wi = model->weights[i];
         float* bi = model->biases[i];
+        float* zi = z[i];
+        float* ai_next = a[i+1];
+#if NN_USE_ACCELERATE
+        // Copy bias into z, then GEMV accumulate W*a into z
+        memcpy(zi, bi, sizeof(float) * (size_t)curr);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, curr, prev, 1.0f, Wi, prev, a[i], 1, 1.0f, zi, 1);
+        for (int r = 0; r < curr; ++r) ai_next[r] = model->layers[i].activate(zi[r]);
+#else
         for (int r = 0; r < curr; ++r) {
             double sum = bi[r];
             const float* wrow = Wi + (long)r * prev;
             for (int c = 0; c < prev; ++c) sum += wrow[c] * a[i][c];
-            z[i][r] = (float)sum;
-            a[i+1][r] = model->layers[i].activate(z[i][r]);
+            zi[r] = (float)sum;
+            ai_next[r] = model->layers[i].activate(zi[r]);
         }
+#endif
         prev = curr;
     }
 
-    // Loss (binary cross-entropy)
+    // Loss (binary cross-entropy) using output activation a[L][0]
     float o = a[L][0];
     if (o < 1e-7f) o = 1e-7f; if (o > 1.0f - 1e-7f) o = 1.0f - 1e-7f;
     float loss = -(y * logf(o) + (1.0f - y) * logf(1.0f - o));
 
     // Backward
     // Output delta: dL/da * da/dz
-    delta[L-1] = (float*)malloc(sizeof(float) * model->arch.output_neurons);
-    if (!delta[L-1]) goto oom;
     // dL/da = -(y/o) + (1-y)/(1-o)
     float dL_da = -(y / o) + ((1.0f - y) / (1.0f - o));
-    float da_dz;
-    // derivative for output activation
     float zL = z[L-1][0];
+    float da_dz;
     if (model->layers[L-1].derivative) da_dz = model->layers[L-1].derivative(zL);
-    else { // fallback for sigmoid
-        float s = 1.0f / (1.0f + expf(-zL));
-        da_dz = s * (1.0f - s);
-    }
+    else { float s = 1.0f / (1.0f + expf(-zL)); da_dz = s * (1.0f - s); }
     delta[L-1][0] = dL_da * da_dz;
 
-    // Hidden deltas
-    for (int i = L-2; i >= 0; --i) {
+    // Hidden deltas: delta[i] = (W[i+1]^T * delta[i+1]) .* act'(z[i])
+    for (int i = L - 2; i >= 0; --i) {
         int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
                                                        : model->arch.output_neurons; // not used
         int next = (i+1 < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i+1]
                                                          : model->arch.output_neurons;
-        delta[i] = (float*)malloc(sizeof(float) * curr);
-        if (!delta[i]) goto oom;
+        float* Wnext = model->weights[i+1];
+#if NN_USE_ACCELERATE
+        // delta[i] = Wnext^T * delta[i+1]
+        cblas_sgemv(CblasRowMajor, CblasTrans, next, curr, 1.0f, Wnext, curr, delta[i+1], 1, 0.0f, delta[i], 1);
+        // elementwise multiply by derivative
+        for (int r = 0; r < curr; ++r) {
+            float dz = model->layers[i].derivative(z[i][r]);
+            delta[i][r] = delta[i][r] * dz;
+        }
+#else
         for (int r = 0; r < curr; ++r) {
             double sum = 0.0;
-            // sum_j W_{j,r}^{i+1} * delta_{j}^{i+1}
-            float* Wnext = model->weights[i+1];
             for (int j = 0; j < next; ++j) {
                 sum += Wnext[(long)j * curr + r] * delta[i+1][j];
             }
             float dz = model->layers[i].derivative(z[i][r]);
             delta[i][r] = (float)(sum * dz);
         }
+#endif
     }
 
     // Update weights depending on optimizer (SGD/RMSprop/Adam) with L1/L2 on weights
@@ -923,7 +989,6 @@ static float train_one_example(MLPModel* model, const float* x, float y, float l
         for (int r = 0; r < curr; ++r) {
             // bias grad
             float g_b = delta[i][r];
-            // apply optimizer to bias
             if (model->optimizer == NN_OPTIMIZER_SGD) {
                 bi[r] -= lr * g_b;
             } else if (model->optimizer == NN_OPTIMIZER_RMSPROP) {
@@ -941,18 +1006,46 @@ static float train_one_example(MLPModel* model, const float* x, float y, float l
                 float vhat = vB[r] / (1.0f - b2t);
                 bi[r] -= lr * mhat / (sqrtf(vhat) + model->epsilon);
             }
-            // weights
+
+            // weight row update
             float* wrow = Wi + (long)r * prev;
-            for (int c = 0; c < prev; ++c) {
-                float grad = delta[i][r] * a[i][c];
-                if (l2 > 0.0f) grad += l2 * wrow[c];
-                if (l1 > 0.0f) grad += l1 * (wrow[c] > 0.0f ? 1.0f : (wrow[c] < 0.0f ? -1.0f : 0.0f));
-                if (model->optimizer == NN_OPTIMIZER_SGD) {
+            if (model->optimizer == NN_OPTIMIZER_SGD) {
+                // Apply L2 via scaling, then gradient via AXPY, then L1 via loop
+#if NN_USE_ACCELERATE
+                if (l2 > 0.0f) {
+                    float scale = 1.0f - lr * l2;
+                    cblas_sscal(prev, scale, wrow, 1);
+                }
+                // wrow += (-lr * delta) * a[i]
+                cblas_saxpy(prev, -lr * delta[i][r], a[i], 1, wrow, 1);
+                if (l1 > 0.0f) {
+                    float step = lr * l1;
+                    for (int c = 0; c < prev; ++c) {
+                        float s = (wrow[c] > 0.0f ? 1.0f : (wrow[c] < 0.0f ? -1.0f : 0.0f));
+                        wrow[c] -= step * s;
+                    }
+                }
+#else
+                for (int c = 0; c < prev; ++c) {
+                    float grad = delta[i][r] * a[i][c];
+                    if (l2 > 0.0f) grad += l2 * wrow[c];
+                    if (l1 > 0.0f) grad += l1 * (wrow[c] > 0.0f ? 1.0f : (wrow[c] < 0.0f ? -1.0f : 0.0f));
                     wrow[c] -= lr * grad;
-                } else if (model->optimizer == NN_OPTIMIZER_RMSPROP) {
+                }
+#endif
+            } else if (model->optimizer == NN_OPTIMIZER_RMSPROP) {
+                for (int c = 0; c < prev; ++c) {
+                    float grad = delta[i][r] * a[i][c];
+                    if (l2 > 0.0f) grad += l2 * wrow[c];
+                    if (l1 > 0.0f) grad += l1 * (wrow[c] > 0.0f ? 1.0f : (wrow[c] < 0.0f ? -1.0f : 0.0f));
                     vW[(long)r * prev + c] = model->beta2 * vW[(long)r * prev + c] + (1.0f - model->beta2) * grad * grad;
                     wrow[c] -= lr * grad / (sqrtf(vW[(long)r * prev + c]) + model->epsilon);
-                } else { // Adam
+                }
+            } else { // Adam
+                for (int c = 0; c < prev; ++c) {
+                    float grad = delta[i][r] * a[i][c];
+                    if (l2 > 0.0f) grad += l2 * wrow[c];
+                    if (l1 > 0.0f) grad += l1 * (wrow[c] > 0.0f ? 1.0f : (wrow[c] < 0.0f ? -1.0f : 0.0f));
                     mW[(long)r * prev + c] = model->beta1 * mW[(long)r * prev + c] + (1.0f - model->beta1) * grad;
                     vW[(long)r * prev + c] = model->beta2 * vW[(long)r * prev + c] + (1.0f - model->beta2) * grad * grad;
                     float b1t = powf(model->beta1, (float)(model->adam_timestep + 1));
@@ -966,38 +1059,31 @@ static float train_one_example(MLPModel* model, const float* x, float y, float l
         prev = curr;
     }
 
-    // Cleanup
-    for (int i = 0; i < L; ++i) { free(z[i]); free(delta[i]); }
-    for (int i = 1; i <= L; ++i) free(a[i]);
-    free(a); free(z); free(delta);
     return loss;
-oom:
-    for (int i = 0; i < L; ++i) { if (z && z[i]) free(z[i]); if (delta && delta[i]) free(delta[i]); }
-    if (a) { for (int i = 1; i <= L; ++i) if (a[i]) free(a[i]); }
-    free(a); free(z); free(delta);
-    return NAN;
 }
 
 // Compute loss for (x,y) without updating parameters
 static float compute_loss_only(MLPModel* model, const float* x, float y) {
     int L = model->num_weight_sets;
-    float** a = (float**)calloc(L + 1, sizeof(float*));
-    float** z = (float**)calloc(L, sizeof(float*));
-    if (!a || !z) { free(a); free(z); return NAN; }
+    float** a = model->scratch_a;
+    float** z = model->scratch_z;
+    if (!a || !z) return NAN;
     a[0] = (float*)x; int prev = model->arch.input_neurons;
     for (int i=0;i<L;++i) {
         int curr = (i < model->arch.num_hidden_layers) ? model->arch.hidden_neurons_per_layer[i]
                                                        : model->arch.output_neurons;
-        z[i] = (float*)malloc(sizeof(float)*curr);
-        a[i+1] = (float*)malloc(sizeof(float)*curr);
-        if (!z[i] || !a[i+1]) { for (int k=0;k<=i;++k){ if(z[k])free(z[k]); if(k>0&&a[k])free(a[k]); } free(a); free(z); return NAN; }
         const float* Wi = model->weights[i]; const float* bi = model->biases[i];
+#if NN_USE_ACCELERATE
+        memcpy(z[i], bi, sizeof(float) * (size_t)curr);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, curr, prev, 1.0f, Wi, prev, a[i], 1, 1.0f, z[i], 1);
+        for (int r=0;r<curr;++r) a[i+1][r] = model->layers[i].activate(z[i][r]);
+#else
         for (int r=0;r<curr;++r){ double sum=bi[r]; const float* wrow = Wi + (long)r * prev; for (int c=0;c<prev;++c) sum += wrow[c]*a[i][c]; z[i][r] = (float)sum; a[i+1][r] = model->layers[i].activate(z[i][r]); }
+#endif
         prev = curr;
     }
     float o = a[L][0]; if (o < 1e-7f) o = 1e-7f; if (o > 1.0f - 1e-7f) o = 1.0f - 1e-7f;
     float loss = -(y * logf(o) + (1.0f - y) * logf(1.0f - o));
-    for (int i=0;i<L;++i) { free(z[i]); } for (int i=1;i<=L;++i) free(a[i]); free(a); free(z);
     return loss;
 }
 
@@ -1148,6 +1234,8 @@ NN_Model* nn_model_create(int input_neurons,
         model->v_biases[i] = (float*)calloc(len, sizeof(float));
         if (!model->m_biases[i] || !model->v_biases[i]) { nn_model_free(m); return NULL; }
     }
+    // Allocate scratch buffers for faster per-sample training
+    if (allocate_scratch(model) != 0) { nn_model_free(m); return NULL; }
     return m;
 }
 
@@ -1179,6 +1267,8 @@ NN_Model* nn_model_load(const char* model_path) {
         model->v_biases[i] = (float*)calloc(len, sizeof(float));
         if (!model->m_biases[i] || !model->v_biases[i]) { nn_model_free(m); return NULL; }
     }
+    // Allocate scratch buffers for faster per-sample training
+    if (allocate_scratch(model) != 0) { nn_model_free(m); return NULL; }
     return m;
 }
 
@@ -1875,64 +1965,56 @@ static float perform_forward_pass(const MLPModel* model, const float* input_data
 
     // Iterate through all layers (input -> hidden1 ... -> output)
     for (int layer_idx = 0; layer_idx < model->num_weight_sets; ++layer_idx) {
-        int current_layer_num_neurons;
-        if (layer_idx < model->arch.num_hidden_layers) {
-            current_layer_num_neurons = model->arch.hidden_neurons_per_layer[layer_idx];
-        } else { // Output layer
-            current_layer_num_neurons = model->arch.output_neurons;
-        }
+        int current_layer_num_neurons = (layer_idx < model->arch.num_hidden_layers)
+            ? model->arch.hidden_neurons_per_layer[layer_idx]
+            : model->arch.output_neurons;
 
-        // Allocate buffer for the current layer's activations (if not the input layer)
-        // The output of this loop iteration will be the input for the next
-        if (layer_idx < model->num_weight_sets) { // For all layers including output
-             next_activations_buffer = (float*)malloc(current_layer_num_neurons * sizeof(float));
-             if (!next_activations_buffer) {
-                 fprintf(stderr, "NoodleNet Error: Malloc failed for activations buffer.\n");
-                 if (current_activations != input_data) free(current_activations); // Free previously allocated buffer
-                 return NAN; // Indicate error
-             }
+        next_activations_buffer = (float*)malloc((size_t)current_layer_num_neurons * sizeof(float));
+        if (!next_activations_buffer) {
+            fprintf(stderr, "NoodleNet Error: Malloc failed for activations buffer.\n");
+            if (current_activations != input_data) free(current_activations);
+            return NAN;
         }
 
         const float* layer_weights = model->weights[layer_idx];
         const float* layer_biases = model->biases[layer_idx];
 
-        for (int j = 0; j < current_layer_num_neurons; ++j) { // For each neuron in current layer
-            float weighted_sum = 0.0f;
-            // Weights for neuron j are: W_j0, W_j1, ..., W_j(prev_layer_num_neurons-1)
-            // In sensuser, weights are stored in a matrix of shape (output_neurons, input_neurons)
-            // This means the weights for output neuron j are stored in row j
-            // When flattened to a 1D array, the weights for output neuron j start at index (j * prev_layer_num_neurons)
-            // So the weight connecting input neuron i to output neuron j is at index (j * prev_layer_num_neurons + i)
-
-            for (int i = 0; i < prev_layer_num_neurons; ++i) { // For each neuron in previous layer
-                // Access weight from neuron i (previous) to neuron j (current)
-                // In sensuser, weights are stored as (output_neuron, input_neuron)
-                // So we need to access as layer_weights[j * prev_layer_num_neurons + i]
-                weighted_sum += current_activations[i] * layer_weights[j * prev_layer_num_neurons + i];
-            }
-            weighted_sum += layer_biases[j];
-            // Use the appropriate activation function for this layer
-            next_activations_buffer[j] = model->layers[layer_idx].activate(weighted_sum);
+#if NN_USE_ACCELERATE
+        // next_activations_buffer = act( W * current_activations + b )
+        // compute z into temp buffer
+        float* zbuf = (float*)malloc((size_t)current_layer_num_neurons * sizeof(float));
+        if (!zbuf) {
+            if (current_activations != input_data) free(current_activations);
+            free(next_activations_buffer);
+            return NAN;
         }
-
-        // Free previous layer's activations buffer (if it wasn't the input_data itself)
-        if (current_activations != input_data) {
-            free(current_activations);
+        memcpy(zbuf, layer_biases, sizeof(float) * (size_t)current_layer_num_neurons);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    current_layer_num_neurons, prev_layer_num_neurons,
+                    1.0f, layer_weights, prev_layer_num_neurons,
+                    current_activations, 1,
+                    1.0f, zbuf, 1);
+        for (int j = 0; j < current_layer_num_neurons; ++j) {
+            next_activations_buffer[j] = model->layers[layer_idx].activate(zbuf[j]);
         }
-        current_activations = next_activations_buffer; // Current output becomes next input
-        next_activations_buffer = NULL; // Buffer ownership transferred
+        free(zbuf);
+#else
+        for (int j = 0; j < current_layer_num_neurons; ++j) {
+            double sum = layer_biases[j];
+            const float* wrow = layer_weights + (long)j * prev_layer_num_neurons;
+            for (int i = 0; i < prev_layer_num_neurons; ++i) sum += wrow[i] * current_activations[i];
+            next_activations_buffer[j] = model->layers[layer_idx].activate((float)sum);
+        }
+#endif
+
+        if (current_activations != input_data) free(current_activations);
+        current_activations = next_activations_buffer;
+        next_activations_buffer = NULL;
         prev_layer_num_neurons = current_layer_num_neurons;
     }
 
-    // The final `current_activations` buffer holds the output layer's activations.
-    // Since output is 1 neuron, this is current_activations[0].
     float final_prediction = current_activations[0];
-
-    // Free the last activations buffer
-    if (current_activations != input_data) { // Should always be true unless 0 layers (which is invalid)
-        free(current_activations);
-    }
-
+    if (current_activations != input_data) free(current_activations);
     return final_prediction;
 }
 

@@ -35,3 +35,9 @@ Thats it. The library is designed to be easy to use with minimal API surface and
 If you have linking issues when running make, try the alternative make file "NoodleNetMakefile"
 
 make -f NoodleNetMakefile
+
+## Performance and Build Options (macOS)
+
+- Accelerated math: On macOS, the build links against the Apple Accelerate framework to speed up forward and training passes via BLAS. This is automatic when building on Darwin.
+- Optimization flags: The C library is compiled with `-O3` by default.
+- No GPU/MPS required: Current acceleration is CPU-based and leverages highly optimized vectorized routines.

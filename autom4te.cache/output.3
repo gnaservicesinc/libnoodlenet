@@ -655,6 +655,7 @@ ac_subst_vars='am__EXEEXT_FALSE
 am__EXEEXT_TRUE
 LTLIBOBJS
 LIB@&t@OBJS
+ACCELERATE_LIBS
 CXXCPP
 LT_SYS_LIBRARY_PATH
 OTOOL64
@@ -18485,6 +18486,16 @@ then :
   printf "%s\n" "@%:@define HAVE_MATH_H 1" >>confdefs.h
 
 fi
+
+
+# Determine host OS for optional Apple Accelerate
+
+ACCELERATE_LIBS=""
+case $host_os in
+  darwin*)
+    ACCELERATE_LIBS="-Wl,-framework,Accelerate"
+    ;;
+esac
 
 
 # Configure files to generate
