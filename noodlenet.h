@@ -46,6 +46,7 @@ typedef struct {
     int include_bias;          // if nonzero, export biases as 1xN PGM per layer
     int include_stats;         // if nonzero, write stats text per layer
     int raw_weights_full;      // if nonzero and mode==WEIGHTS, export raw (curr x prev) instead of square
+    int only_layer;            // 0-based hidden layer index to export; -1 for all
 } NN_VisOptions;
 
 /**
@@ -103,6 +104,7 @@ int nn_train_from_dirs(NN_Model* model,
                        const char* val_dir,
                        int steps,
                        int batch_size,
+                       int shuffle,
                        float learning_rate,
                        float l1_lambda,
                        float l2_lambda,
@@ -114,6 +116,16 @@ int nn_export_layer_visualizations(const NN_Model* model, const char* output_dir
 
 // Extended export with options
 int nn_export_layer_visualizations_ex(const NN_Model* model, const char* output_dir, const NN_VisOptions* options);
+
+// Render a single hidden layer visualization into an 8-bit grayscale buffer.
+// Returns 0 on success and allocates out_pixels via malloc; caller must free().
+// layer_index is 0-based among hidden layers.
+int nn_render_hidden_layer_visualization(const NN_Model* model,
+                                         int layer_index,
+                                         const NN_VisOptions* options,
+                                         unsigned char** out_pixels,
+                                         int* out_width,
+                                         int* out_height);
 
 // Evaluate a model on directories of images.
 // Returns 0 on success. Any of the output pointers may be NULL if not needed.
@@ -139,6 +151,34 @@ int nn_get_biases(const NN_Model* model, int layer_index, float* out, size_t out
 int nn_compute_activations_from_image(const NN_Model* model, const char* image_path, int layer_index, float* out, size_t out_len);
 // Compute pre-activations z at a given layer for an image; valid layer_index in [1..num_weight_sets]
 int nn_compute_pre_activations_from_image(const NN_Model* model, const char* image_path, int layer_index, float* out, size_t out_len);
+
+// --- Model metadata (data dirs and training lock) ---
+// Set directories used for training (absolute paths preferred).
+int nn_model_set_data_dirs(NN_Model* model,
+                           const char* pos_dir,
+                           const char* neg_dir,
+                           const char* val_dir);
+
+// Get directories from model metadata; any output may be NULL if not set.
+// Returned pointers are owned by the model and valid until nn_model_free.
+int nn_model_get_data_dirs(const NN_Model* model,
+                           const char** out_pos_dir,
+                           const char** out_neg_dir,
+                           const char** out_val_dir);
+
+// Set training parameters that should be locked for subsequent training runs.
+int nn_model_set_locked_training_params(NN_Model* model,
+                                        int batch_size,
+                                        float learning_rate,
+                                        int shuffle,
+                                        NN_Optimizer optimizer);
+
+// Get locked training parameters; returns 0 if present, -1 if none saved.
+int nn_model_get_locked_training_params(const NN_Model* model,
+                                        int* out_batch_size,
+                                        float* out_learning_rate,
+                                        int* out_shuffle,
+                                        NN_Optimizer* out_optimizer);
 
 #ifdef __cplusplus
 } // extern "C"

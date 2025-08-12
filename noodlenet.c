@@ -183,6 +183,15 @@ typedef struct {
     float** v_weights; // moments for Adam/RMSprop
     float** m_biases;
     float** v_biases;
+    // Persisted metadata
+    char* meta_pos_dir;
+    char* meta_neg_dir;
+    char* meta_val_dir;
+    int   meta_has_locked;
+    int   meta_locked_batch_size;
+    float meta_locked_learning_rate;
+    int   meta_locked_shuffle;
+    NN_Optimizer meta_locked_optimizer;
 } MLPModel;
 
 // Public opaque alias
@@ -314,6 +323,12 @@ static void free_mlp_model(MLPModel* model) {
     }
 
     model->num_weight_sets = 0;
+
+    // Free metadata strings
+    if (model->meta_pos_dir) { free(model->meta_pos_dir); model->meta_pos_dir = NULL; }
+    if (model->meta_neg_dir) { free(model->meta_neg_dir); model->meta_neg_dir = NULL; }
+    if (model->meta_val_dir) { free(model->meta_val_dir); model->meta_val_dir = NULL; }
+    model->meta_has_locked = 0;
 }
 
 static float sigmoid(float x) {
@@ -547,6 +562,39 @@ static int load_model_from_file(const char* model_path, MLPModel* model) {
 
     // Set activation function for output layer
     set_activation_functions(&model->layers[model->arch.num_hidden_layers], output_activation);
+
+    // --- Optional metadata ---
+    cJSON* data_dirs = cJSON_GetObjectItemCaseSensitive(root_json, "data_dirs");
+    if (cJSON_IsObject(data_dirs)) {
+        cJSON* p = cJSON_GetObjectItemCaseSensitive(data_dirs, "positive");
+        cJSON* n = cJSON_GetObjectItemCaseSensitive(data_dirs, "negative");
+        cJSON* v = cJSON_GetObjectItemCaseSensitive(data_dirs, "validation");
+        // Only keep dirs that exist
+        struct stat st;
+        if (cJSON_IsString(p) && p->valuestring && stat(p->valuestring, &st) == 0 && S_ISDIR(st.st_mode)) model->meta_pos_dir = strdup(p->valuestring);
+        if (cJSON_IsString(n) && n->valuestring && stat(n->valuestring, &st) == 0 && S_ISDIR(st.st_mode)) model->meta_neg_dir = strdup(n->valuestring);
+        if (cJSON_IsString(v) && v->valuestring && stat(v->valuestring, &st) == 0 && S_ISDIR(st.st_mode)) model->meta_val_dir = strdup(v->valuestring);
+    }
+    cJSON* lock = cJSON_GetObjectItemCaseSensitive(root_json, "training_locked_params");
+    if (cJSON_IsObject(lock)) {
+        cJSON* bs = cJSON_GetObjectItemCaseSensitive(lock, "batch_size");
+        cJSON* lr = cJSON_GetObjectItemCaseSensitive(lock, "learning_rate");
+        cJSON* sh = cJSON_GetObjectItemCaseSensitive(lock, "shuffle");
+        cJSON* opt = cJSON_GetObjectItemCaseSensitive(lock, "optimizer");
+        if (cJSON_IsNumber(bs) && cJSON_IsNumber(lr) && (cJSON_IsNumber(sh) || cJSON_IsBool(sh))) {
+            model->meta_has_locked = 1;
+            model->meta_locked_batch_size = bs->valueint;
+            model->meta_locked_learning_rate = (float)lr->valuedouble;
+            model->meta_locked_shuffle = cJSON_IsNumber(sh) ? sh->valueint : (cJSON_IsTrue(sh) ? 1 : 0);
+            if (cJSON_IsString(opt) && opt->valuestring) {
+                if (strcmp(opt->valuestring, "Adam") == 0) model->meta_locked_optimizer = NN_OPTIMIZER_ADAM;
+                else if (strcmp(opt->valuestring, "RMSprop") == 0) model->meta_locked_optimizer = NN_OPTIMIZER_RMSPROP;
+                else model->meta_locked_optimizer = NN_OPTIMIZER_SGD;
+            } else {
+                model->meta_locked_optimizer = NN_OPTIMIZER_SGD;
+            }
+        }
+    }
 
     // --- Allocate memory for weights and biases ---
     model->num_weight_sets = model->arch.num_hidden_layers + 1;
@@ -981,6 +1029,24 @@ static int save_model_to_file(const MLPModel* model, const char* model_path) {
     cJSON_AddItemToObject(arch, "hidden_layers", hidden);
     cJSON_AddStringToObject(arch, "output_activation", activation_to_string(model->layers[model->arch.num_hidden_layers].activation_function));
 
+    // Append metadata: data_dirs and training_locked_params if available
+    if (model->meta_pos_dir || model->meta_neg_dir || model->meta_val_dir) {
+        cJSON* data_dirs = cJSON_CreateObject();
+        if (model->meta_pos_dir) cJSON_AddStringToObject(data_dirs, "positive", model->meta_pos_dir);
+        if (model->meta_neg_dir) cJSON_AddStringToObject(data_dirs, "negative", model->meta_neg_dir);
+        if (model->meta_val_dir) cJSON_AddStringToObject(data_dirs, "validation", model->meta_val_dir);
+        cJSON_AddItemToObject(root, "data_dirs", data_dirs);
+    }
+    if (model->meta_has_locked) {
+        cJSON* lock = cJSON_CreateObject();
+        cJSON_AddNumberToObject(lock, "batch_size", model->meta_locked_batch_size);
+        cJSON_AddNumberToObject(lock, "learning_rate", model->meta_locked_learning_rate);
+        cJSON_AddNumberToObject(lock, "shuffle", model->meta_locked_shuffle);
+        const char* oname = (model->meta_locked_optimizer==NN_OPTIMIZER_ADAM?"Adam":(model->meta_locked_optimizer==NN_OPTIMIZER_RMSPROP?"RMSprop":"SGD"));
+        cJSON_AddStringToObject(lock, "optimizer", oname);
+        cJSON_AddItemToObject(root, "training_locked_params", lock);
+    }
+
     char* json_str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!json_str) { fclose(fp); return -1; }
@@ -1158,6 +1224,61 @@ int nn_model_predict_image(const NN_Model* model, const char* image_path, float*
     return 0;
 }
 
+// --- Metadata helpers ---
+int nn_model_set_data_dirs(NN_Model* model,
+                           const char* pos_dir,
+                           const char* neg_dir,
+                           const char* val_dir) {
+    if (!model) return -1;
+    MLPModel* m = &model->impl;
+    if (m->meta_pos_dir) { free(m->meta_pos_dir); m->meta_pos_dir = NULL; }
+    if (m->meta_neg_dir) { free(m->meta_neg_dir); m->meta_neg_dir = NULL; }
+    if (m->meta_val_dir) { free(m->meta_val_dir); m->meta_val_dir = NULL; }
+    if (pos_dir && *pos_dir) m->meta_pos_dir = strdup(pos_dir);
+    if (neg_dir && *neg_dir) m->meta_neg_dir = strdup(neg_dir);
+    if (val_dir && *val_dir) m->meta_val_dir = strdup(val_dir);
+    return 0;
+}
+
+int nn_model_get_data_dirs(const NN_Model* model,
+                           const char** out_pos_dir,
+                           const char** out_neg_dir,
+                           const char** out_val_dir) {
+    if (!model) return -1;
+    if (out_pos_dir) *out_pos_dir = model->impl.meta_pos_dir;
+    if (out_neg_dir) *out_neg_dir = model->impl.meta_neg_dir;
+    if (out_val_dir) *out_val_dir = model->impl.meta_val_dir;
+    return 0;
+}
+
+int nn_model_set_locked_training_params(NN_Model* model,
+                                        int batch_size,
+                                        float learning_rate,
+                                        int shuffle,
+                                        NN_Optimizer optimizer) {
+    if (!model) return -1;
+    model->impl.meta_has_locked = 1;
+    model->impl.meta_locked_batch_size = batch_size;
+    model->impl.meta_locked_learning_rate = learning_rate;
+    model->impl.meta_locked_shuffle = shuffle ? 1 : 0;
+    model->impl.meta_locked_optimizer = optimizer;
+    return 0;
+}
+
+int nn_model_get_locked_training_params(const NN_Model* model,
+                                        int* out_batch_size,
+                                        float* out_learning_rate,
+                                        int* out_shuffle,
+                                        NN_Optimizer* out_optimizer) {
+    if (!model) return -1;
+    if (!model->impl.meta_has_locked) return -1;
+    if (out_batch_size) *out_batch_size = model->impl.meta_locked_batch_size;
+    if (out_learning_rate) *out_learning_rate = model->impl.meta_locked_learning_rate;
+    if (out_shuffle) *out_shuffle = model->impl.meta_locked_shuffle;
+    if (out_optimizer) *out_optimizer = model->impl.meta_locked_optimizer;
+    return 0;
+}
+
 int nn_num_weight_layers(const NN_Model* model) {
     if (!model) return -1;
     return model->impl.num_weight_sets;
@@ -1275,6 +1396,7 @@ int nn_train_from_dirs(NN_Model* model,
                        const char* val_dir,
                        int steps,
                        int batch_size,
+                       int shuffle,
                        float learning_rate,
                        float l1_lambda,
                        float l2_lambda,
@@ -1290,6 +1412,19 @@ int nn_train_from_dirs(NN_Model* model,
     if (!x) { free_string_array(pos_list, pos_count); free_string_array(neg_list, neg_count); return -1; }
     float last_loss = 0.0f;
     int idx = 0;
+    // Combined indices for optional shuffling
+    int combined_count = total;
+    int* order = NULL;
+    int* labels = NULL; // 1=pos, 0=neg
+    if (shuffle && combined_count > 0) {
+        order = (int*)malloc(sizeof(int) * (size_t)combined_count);
+        labels = (int*)malloc(sizeof(int) * (size_t)combined_count);
+        if (!order || !labels) { free(order); free(labels); free(x); free_string_array(pos_list,pos_count); free_string_array(neg_list,neg_count); return -1; }
+        int k=0; for (int i=0;i<pos_count;++i) { order[k]=i; labels[k]=1; k++; }
+        for (int j=0;j<neg_count;++j) { order[k]=j; labels[k]=0; k++; }
+        srand((unsigned int)time(NULL));
+        for (int i=combined_count-1; i>0; --i) { int j = rand() % (i+1); int tmp=order[i]; order[i]=order[j]; order[j]=tmp; int lt=labels[i]; labels[i]=labels[j]; labels[j]=lt; }
+    }
     // Optional validation sets: expect val_dir/pos and val_dir/neg
     char **val_pos_list=NULL, **val_neg_list=NULL; int val_pos_count=0, val_neg_count=0;
     if (val_dir) {
@@ -1304,14 +1439,27 @@ int nn_train_from_dirs(NN_Model* model,
         }
     }
     for (int step = 0; step < steps; ++step) {
+        // reshuffle at each step/epoch if requested
+        if (shuffle && order) {
+            for (int i=combined_count-1; i>0; --i) { int j = rand() % (i+1); int tmp=order[i]; order[i]=order[j]; order[j]=tmp; int lt=labels[i]; labels[i]=labels[j]; labels[j]=lt; }
+            idx = 0;
+        }
         float batch_loss = 0.0f; int batch_items = 0;
         for (int b = 0; b < batch_size; ++b) {
-            // Round-robin through positives then negatives
-            int use_pos = (idx % (total)) < pos_count;
             const char* path = NULL; float y = 0.0f;
-            if (use_pos) { path = pos_list[idx % pos_count]; y = 1.0f; }
-            else { int j = (idx - pos_count) % (neg_count > 0 ? neg_count : 1); if (neg_count > 0) path = neg_list[j]; else path = pos_list[idx % pos_count]; y = 0.0f; }
-            idx++;
+            if (shuffle && order) {
+                if (idx >= combined_count) idx = 0;
+                int is_pos = labels[idx];
+                if (is_pos) { int pidx = order[idx]; if (pidx >= pos_count) pidx %= (pos_count>0?pos_count:1); path = pos_list[pidx]; y = 1.0f; }
+                else { int nidx = order[idx]; if (nidx >= neg_count) nidx %= (neg_count>0?neg_count:1); if (neg_count>0) { path = neg_list[nidx]; y = 0.0f; } else { path = pos_list[nidx % (pos_count>0?pos_count:1)]; y = 0.0f; } }
+                idx++;
+            } else {
+                // Round-robin through positives then negatives
+                int use_pos = (idx % (total)) < pos_count;
+                if (use_pos) { path = pos_list[idx % pos_count]; y = 1.0f; }
+                else { int j = (idx - pos_count) % (neg_count > 0 ? neg_count : 1); if (neg_count > 0) path = neg_list[j]; else path = pos_list[idx % pos_count]; y = 0.0f; }
+                idx++;
+            }
             if (load_and_process_image(path, x) != 0) continue;
             float loss = train_one_example(&model->impl, x, y, learning_rate, l1_lambda, l2_lambda);
             if (!isnan(loss) && !isinf(loss)) { batch_loss += loss; batch_items++; }
@@ -1352,6 +1500,8 @@ int nn_train_from_dirs(NN_Model* model,
         }
     }
     free(x);
+    if (order) free(order);
+    if (labels) free(labels);
     free_string_array(pos_list, pos_count);
     free_string_array(neg_list, neg_count);
     free_string_array(val_pos_list, val_pos_count);
@@ -1411,15 +1561,112 @@ static void map_to_bytes_symmetric_zero(const float* in, unsigned char* out, lon
     }
 }
 
+// Render a single hidden layer visualization to an 8-bit grayscale buffer.
+// The caller is responsible for free() on out_pixels.
+int nn_render_hidden_layer_visualization(const NN_Model* model,
+                                         int layer_index,
+                                         const NN_VisOptions* options,
+                                         unsigned char** out_pixels,
+                                         int* out_width,
+                                         int* out_height) {
+    if (!model || !out_pixels || !out_width || !out_height) return -1;
+    if (layer_index < 0 || layer_index >= model->impl.arch.num_hidden_layers) return -1;
+    NN_VisMode mode = NN_VIS_MODE_WEIGHTS;
+    NN_VisScale scale = NN_VIS_SCALE_MINMAX;
+    int raw_weights_full = 0;
+    if (options) { mode = options->mode; scale = options->scale; raw_weights_full = options->raw_weights_full; }
+
+    int prev = model->impl.arch.input_neurons;
+    for (int i=0;i<layer_index;i++) prev = model->impl.arch.hidden_neurons_per_layer[i];
+    int curr = model->impl.arch.hidden_neurons_per_layer[layer_index];
+    const float* Wi = model->impl.weights[layer_index];
+
+    unsigned char* img = NULL; float* work = NULL; long workN = 0; float minv=0.0f, maxv=0.0f;
+    if (mode == NN_VIS_MODE_WEIGHTS) {
+        if (raw_weights_full) {
+            *out_width = prev; *out_height = curr; workN = (long)curr * (long)prev;
+            work = (float*)malloc(sizeof(float) * (size_t)workN);
+            if (!work) return -1;
+            for (int r=0;r<curr;++r) {
+                const float* wrow = Wi + (long)r * prev;
+                memcpy(work + (size_t)r * (size_t)prev, wrow, sizeof(float) * (size_t)prev);
+            }
+        } else {
+            *out_width = curr; *out_height = curr; workN = (long)curr * (long)curr;
+            work = (float*)malloc(sizeof(float) * (size_t)workN);
+            if (!work) return -1;
+            for (int r=0;r<curr;++r) {
+                const float* wrow = Wi + (long)r * prev;
+                resample_row_uniform(wrow, prev, work + (size_t)r * (size_t)curr, curr);
+            }
+        }
+        minv = maxv = work[0];
+        for (long t=1;t<workN;++t) { float v=work[t]; if (v<minv) minv=v; if (v>maxv) maxv=v; }
+        img = (unsigned char*)malloc((size_t)workN);
+        if (!img) { free(work); return -1; }
+        if (scale == NN_VIS_SCALE_MINMAX) map_to_bytes_minmax(work, img, workN, minv, maxv);
+        else map_to_bytes_symmetric_zero(work, img, workN);
+        free(work);
+    } else { // heatmap
+        const int max_samples = 1024;
+        int use_exact = (prev <= 8192);
+        int samples = use_exact ? prev : ((prev < max_samples) ? prev : max_samples);
+        int* idx = NULL;
+        if (!use_exact) {
+            idx = (int*)malloc(sizeof(int) * (size_t)samples);
+            if (!idx) return -1;
+            for (int k=0;k<samples;++k) {
+                long pos = ((long)k * (long)prev) / (long)samples;
+                if (pos >= prev) pos = prev - 1;
+                idx[k] = (int)pos;
+            }
+        }
+        float* proj = use_exact ? NULL : (float*)malloc(sizeof(float) * (size_t)curr * (size_t)samples);
+        double* norms = (double*)malloc(sizeof(double) * (size_t)curr);
+        if (!norms || (!use_exact && !proj)) { free(idx); free(proj); free(norms); return -1; }
+        for (int r=0;r<curr;++r) {
+            const float* wr = Wi + (long)r * prev; double nrm = 0.0;
+            if (use_exact) {
+                for (int k=0;k<samples;++k) { float v = wr[k]; nrm += (double)v*v; }
+            } else {
+                float* rowp = proj + (size_t)r * (size_t)samples;
+                for (int k=0;k<samples;++k) { float v = wr[idx[k]]; rowp[k] = v; nrm += (double)v*v; }
+            }
+            norms[r] = sqrt(nrm);
+        }
+        long N = (long)curr * (long)curr; work = (float*)malloc(sizeof(float) * (size_t)N);
+        if (!work) { free(idx); free(proj); free(norms); return -1; }
+        for (long t=0;t<N;++t) work[t]=0.0f; float minvv=1.0f, maxvv=-1.0f;
+        for (int r=0;r<curr;++r) {
+            work[(size_t)r * curr + r] = 1.0f;
+            const float* pr = use_exact ? (Wi + (long)r * prev) : (proj + (size_t)r * (size_t)samples); double nr = norms[r];
+            for (int c=r+1;c<curr;++c) {
+                const float* pc = use_exact ? (Wi + (long)c * prev) : (proj + (size_t)c * (size_t)samples); double nc = norms[c]; double dot=0.0;
+                for (int k=0;k<samples;++k) dot += (double)pr[k] * (double)pc[k];
+                float cs=0.0f; if (nr>0.0 && nc>0.0) { double v = dot/(nr*nc); if (v<-1.0) v=-1.0; if (v>1.0) v=1.0; cs=(float)v; }
+                work[(size_t)r * curr + c] = cs; work[(size_t)c * curr + r] = cs; if (cs<minvv && r!=c) minvv=cs; if (cs>maxvv && r!=c) maxvv=cs;
+            }
+        }
+        if (idx) free(idx); if (proj) free(proj); free(norms);
+        img = (unsigned char*)malloc((size_t)N); if (!img){ free(work); return -1; }
+        if (scale == NN_VIS_SCALE_MINMAX) { if (maxvv>minvv) map_to_bytes_minmax(work, img, N, minvv, maxvv); else map_to_bytes_symmetric_zero(work, img, N); }
+        else map_to_bytes_symmetric_zero(work, img, N);
+        *out_width = curr; *out_height = curr; free(work);
+    }
+    *out_pixels = img; return 0;
+}
+
 int nn_export_layer_visualizations_ex(const NN_Model* model, const char* output_dir, const NN_VisOptions* options) {
     if (!model || !output_dir) return -1;
     struct stat st; if (stat(output_dir, &st) != 0) { (void)mkdir(output_dir, 0755); }
     NN_VisMode mode = NN_VIS_MODE_WEIGHTS;
     NN_VisScale scale = NN_VIS_SCALE_MINMAX;
     int include_bias = 0, include_stats = 0, raw_weights_full = 0;
-    if (options) { mode = options->mode; scale = options->scale; include_bias = options->include_bias; include_stats = options->include_stats; raw_weights_full = options->raw_weights_full; }
+    int only_layer = -1;
+    if (options) { mode = options->mode; scale = options->scale; include_bias = options->include_bias; include_stats = options->include_stats; raw_weights_full = options->raw_weights_full; only_layer = options->only_layer; }
     int prev = model->impl.arch.input_neurons;
     for (int i = 0; i < model->impl.arch.num_hidden_layers; ++i) {
+        if (only_layer >= 0 && i != only_layer) { prev = model->impl.arch.hidden_neurons_per_layer[i]; continue; }
         int curr = model->impl.arch.hidden_neurons_per_layer[i];
         const float* Wi = model->impl.weights[i];
         unsigned char* img = NULL;
