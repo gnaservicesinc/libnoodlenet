@@ -898,6 +898,7 @@ static int list_images_in_dir(const char* dir, char*** out_list, int* out_count)
 static float train_one_example(MLPModel* model, const float* x, float y, float lr, float l1, float l2) {
     int L = model->num_weight_sets; // number of layers with parameters
     if (model->optimizer == NN_OPTIMIZER_ADAM) {
+        // Advance Adam timestep once per example for correct bias correction
         model->adam_timestep += 1;
     }
 
@@ -941,6 +942,14 @@ static float train_one_example(MLPModel* model, const float* x, float y, float l
     float loss = -(y * logf(o) + (1.0f - y) * logf(1.0f - o));
 
     // Backward
+    // Warn once if BCE is used with a non-sigmoid 1-dim output, which can harm convergence
+    static int warned_act_mismatch = 0;
+    if (!warned_act_mismatch && model->arch.output_neurons == 1 &&
+        model->layers[L-1].activation_function != NN_ACTIVATION_FUNCTION_SIGMOID) {
+        fprintf(stderr, "NoodleNet Warning: binary cross-entropy with non-sigmoid output activation (%s).\n",
+                activation_to_string(model->layers[L-1].activation_function));
+        warned_act_mismatch = 1;
+    }
     // Output delta: dL/da * da/dz
     // dL/da = -(y/o) + (1-y)/(1-o)
     float dL_da = -(y / o) + ((1.0f - y) / (1.0f - o));
@@ -1000,8 +1009,9 @@ static float train_one_example(MLPModel* model, const float* x, float y, float l
                 float* vB = model->v_biases[i];
                 mB[r] = model->beta1 * mB[r] + (1.0f - model->beta1) * g_b;
                 vB[r] = model->beta2 * vB[r] + (1.0f - model->beta2) * (g_b * g_b);
-                float b1t = powf(model->beta1, (float)(model->adam_timestep + 1));
-                float b2t = powf(model->beta2, (float)(model->adam_timestep + 1));
+                // Bias correction uses current timestep t
+                float b1t = powf(model->beta1, (float)(model->adam_timestep));
+                float b2t = powf(model->beta2, (float)(model->adam_timestep));
                 float mhat = mB[r] / (1.0f - b1t);
                 float vhat = vB[r] / (1.0f - b2t);
                 bi[r] -= lr * mhat / (sqrtf(vhat) + model->epsilon);
@@ -1048,8 +1058,9 @@ static float train_one_example(MLPModel* model, const float* x, float y, float l
                     if (l1 > 0.0f) grad += l1 * (wrow[c] > 0.0f ? 1.0f : (wrow[c] < 0.0f ? -1.0f : 0.0f));
                     mW[(long)r * prev + c] = model->beta1 * mW[(long)r * prev + c] + (1.0f - model->beta1) * grad;
                     vW[(long)r * prev + c] = model->beta2 * vW[(long)r * prev + c] + (1.0f - model->beta2) * grad * grad;
-                    float b1t = powf(model->beta1, (float)(model->adam_timestep + 1));
-                    float b2t = powf(model->beta2, (float)(model->adam_timestep + 1));
+                    // Bias correction uses current timestep t
+                    float b1t = powf(model->beta1, (float)(model->adam_timestep));
+                    float b2t = powf(model->beta2, (float)(model->adam_timestep));
                     float mhat = mW[(long)r * prev + c] / (1.0f - b1t);
                     float vhat = vW[(long)r * prev + c] / (1.0f - b2t);
                     wrow[c] -= lr * mhat / (sqrtf(vhat) + model->epsilon);
@@ -1445,11 +1456,10 @@ int nn_compute_pre_activations_from_image(const NN_Model* model, const char* ima
     if (!model || !image_path || !out) return -1;
     int L = model->impl.num_weight_sets;
     if (layer_index < 1 || layer_index > L) return -1;
-    int expected_len = (layer_index < model->impl.arch.num_hidden_layers) ? model->impl.arch.hidden_neurons_per_layer[layer_index]
-                                                                          : model->impl.arch.output_neurons;
-    // Correction: for z at layer_index, size equals that layer's neuron count
-    expected_len = (layer_index <= model->impl.arch.num_hidden_layers) ? model->impl.arch.hidden_neurons_per_layer[layer_index-1]
-                                                                      : model->impl.arch.output_neurons;
+    // For z at layer_index, size equals that layer's neuron count
+    int expected_len = (layer_index <= model->impl.arch.num_hidden_layers)
+                       ? model->impl.arch.hidden_neurons_per_layer[layer_index - 1]
+                       : model->impl.arch.output_neurons;
     if (out_len < (size_t)expected_len) return -1;
     float* x = (float*)malloc(sizeof(float) * EXPECTED_INPUT_NEURONS);
     if (!x) return -1;

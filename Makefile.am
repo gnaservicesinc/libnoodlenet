@@ -6,7 +6,7 @@ lib_LTLIBRARIES = libnoodlenet.la libnoodlenet_cpp.la
 libnoodlenet_la_SOURCES = noodlenet.c cJSON.c
 libnoodlenet_la_CFLAGS = -std=c11 -O3
 libnoodlenet_la_LDFLAGS = -version-info 0:0:0
-libnoodlenet_la_LIBADD = $(ACCELERATE_LIBS)
+libnoodlenet_la_LIBADD = $(ACCELERATE_LIBS) $(OPENMP_LIBS)
 
 # C++ library
 libnoodlenet_cpp_la_SOURCES = noodlenet.cpp

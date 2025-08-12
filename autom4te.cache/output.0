@@ -655,6 +655,9 @@ ac_subst_vars='am__EXEEXT_FALSE
 am__EXEEXT_TRUE
 LTLIBOBJS
 LIB@&t@OBJS
+OPENMP_LIBS
+LTO_CACHE_PATH
+ACCELERATE_LIBS
 CXXCPP
 LT_SYS_LIBRARY_PATH
 OTOOL64
@@ -796,6 +799,10 @@ with_aix_soname
 with_gnu_ld
 with_sysroot
 enable_libtool_lock
+enable_thin_lto
+enable_polly_omp
+enable_polly_vectorize
+with_polly_threads
 '
       ac_precious_vars='build_alias
 host_alias
@@ -1453,6 +1460,11 @@ Optional Features:
                           shared library versioning (aka "SONAME") variant to
                           provide on AIX, @<:@default=aix@:>@.
   --disable-libtool-lock  avoid locking (might break parallel builds)
+  --disable-thin-lto      Disable Thin LTO on macOS
+  --enable-polly-omp      Enable Polly automatic OpenMP parallelization when
+                          using LLVM clang
+  --enable-polly-vectorize 
+                          Also enable Polly vectorizer (stripmine)
 
 Optional Packages:
   --with-PACKAGE[=ARG]    use PACKAGE [ARG=yes]
@@ -1460,6 +1472,7 @@ Optional Packages:
   --with-gnu-ld           assume the C compiler uses GNU ld @<:@default=no@:>@
   --with-sysroot@<:@=DIR@:>@    Search for dependent libraries within DIR (or the
                           compiler's sysroot if not specified).
+  --with-polly-threads=N  Set Polly OpenMP threads (default 12)
 
 Some influential environment variables:
   CC          C compiler command
@@ -18485,6 +18498,165 @@ then :
   printf "%s\n" "@%:@define HAVE_MATH_H 1" >>confdefs.h
 
 fi
+
+
+# Determine host OS for optional Apple Accelerate
+
+ACCELERATE_LIBS=""
+case $host_os in
+  darwin*)
+    ACCELERATE_LIBS="-Wl,-framework,Accelerate"
+    ;;
+esac
+
+
+# Optional Thin LTO setup for macOS
+case $host_os in
+  darwin*)
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for compiler vendor (Apple clang vs LLVM clang)" >&5
+printf %s "checking for compiler vendor (Apple clang vs LLVM clang)... " >&6; }
+    cc_version_str=`$CC --version 2>/dev/null | head -n 1`
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $cc_version_str" >&5
+printf "%s\n" "$cc_version_str" >&6; }
+
+    # LTO cache path at project root (build directory)
+    LTO_CACHE_PATH="$PWD/ltocache"
+    
+
+    # Enable thin LTO by default on macOS; allow override via --disable-thin-lto
+    @%:@ Check whether --enable-thin-lto was given.
+if test ${enable_thin_lto+y}
+then :
+  enableval=$enable_thin_lto; 
+else case e in @%:@(
+  e) enable_thin_lto=yes ;;
+esac
+fi
+
+
+    if test "x$enable_thin_lto" = "xyes"; then
+      { printf "%s\n" "$as_me:${as_lineno-$LINENO}: Enabling Thin LTO (thin) with cache at $LTO_CACHE_PATH" >&5
+printf "%s\n" "$as_me: Enabling Thin LTO (thin) with cache at $LTO_CACHE_PATH" >&6;}
+      CFLAGS="$CFLAGS -flto=thin -fPIC -Wl,-cache_path_lto,$LTO_CACHE_PATH"
+      CXXFLAGS="$CXXFLAGS -flto=thin -fPIC -Wl,-cache_path_lto,$LTO_CACHE_PATH"
+      LDFLAGS="$LDFLAGS -flto=thin -fPIC -L/usr/local/lib -Wl,-rpath,/usr/local/lib -Wl,-cache_path_lto,$LTO_CACHE_PATH"
+
+      case "$cc_version_str" in
+        *"Apple clang"*)
+          # Prefer ld-classic from Xcode or Command Line Tools
+          { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for ld-classic linker" >&5
+printf %s "checking for ld-classic linker... " >&6; }
+          for p in \
+            /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld-classic \
+            /Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld-classic \
+            /Library/Developer/CommandLineTools/usr/bin/ld-classic; do
+            if test -x "$p"; then
+              LD="$p"
+              break
+            fi
+          done
+          if test "x$LD" != "x"; then
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $LD" >&5
+printf "%s\n" "$LD" >&6; }
+          else
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: not found" >&5
+printf "%s\n" "not found" >&6; }
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: ld-classic not found; Thin LTO may not link correctly" >&5
+printf "%s\n" "$as_me: WARNING: ld-classic not found; Thin LTO may not link correctly" >&2;}
+          fi
+          ;;
+        *"clang version "*)
+          # LLVM clang: use InstalledDir/ld64.lld
+          { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for ld64.lld linker" >&5
+printf %s "checking for ld64.lld linker... " >&6; }
+          instdir=`$CC --version 2>/dev/null | sed -n 's/^InstalledDir: *\(.*\)/\1/p' | head -n 1`
+          if test "x$instdir" != "x" && test -x "$instdir/ld64.lld"; then
+            LD="$instdir/ld64.lld"
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $LD" >&5
+printf "%s\n" "$LD" >&6; }
+          else
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: not found" >&5
+printf "%s\n" "not found" >&6; }
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: ld64.lld not found in InstalledDir; Thin LTO may not link correctly" >&5
+printf "%s\n" "$as_me: WARNING: ld64.lld not found in InstalledDir; Thin LTO may not link correctly" >&2;}
+          fi
+          ;;
+      esac
+    fi
+    ;;
+esac
+
+# Optional Polly + OpenMP when using LLVM clang (not Apple clang)
+@%:@ Check whether --enable-polly-omp was given.
+if test ${enable_polly_omp+y}
+then :
+  enableval=$enable_polly_omp; 
+else case e in @%:@(
+  e) enable_polly_omp=auto ;;
+esac
+fi
+
+@%:@ Check whether --enable-polly-vectorize was given.
+if test ${enable_polly_vectorize+y}
+then :
+  enableval=$enable_polly_vectorize; 
+else case e in @%:@(
+  e) enable_polly_vectorize=no ;;
+esac
+fi
+
+
+@%:@ Check whether --with-polly-threads was given.
+if test ${with_polly_threads+y}
+then :
+  withval=$with_polly_threads; polly_threads="$withval"
+else case e in @%:@(
+  e) polly_threads=12 ;;
+esac
+fi
+
+
+OPENMP_LIBS=""
+case "$enable_polly_omp" in
+  yes|auto)
+    case "$cc_version_str" in
+      *"clang version "*)
+        # Prefer LLVM clang (non-Apple). Try to enable Polly and OpenMP if libomp is present.
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for OpenMP header and library in /usr/local" >&5
+printf %s "checking for OpenMP header and library in /usr/local... " >&6; }
+        if test -f "/usr/local/include/omp.h" -a -f "/usr/local/lib/libomp.dylib"; then
+          { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: found" >&5
+printf "%s\n" "found" >&6; }
+          { printf "%s\n" "$as_me:${as_lineno-$LINENO}: Enabling Polly (+parallel) with $polly_threads threads" >&5
+printf "%s\n" "$as_me: Enabling Polly (+parallel) with $polly_threads threads" >&6;}
+          CFLAGS="$CFLAGS -I/usr/local/include -D_THREAD_SAFE -Xclang -fopenmp -mllvm -polly -mllvm -polly-parallel -mllvm -polly-omp-backend=LLVM -mllvm -polly-num-threads=$polly_threads"
+          CXXFLAGS="$CXXFLAGS -I/usr/local/include -D_THREAD_SAFE -Xclang -fopenmp -mllvm -polly -mllvm -polly-parallel -mllvm -polly-omp-backend=LLVM -mllvm -polly-num-threads=$polly_threads"
+          if test "x$enable_polly_vectorize" = "xyes"; then
+            CFLAGS="$CFLAGS -mllvm -polly-vectorizer=stripmine"
+            CXXFLAGS="$CXXFLAGS -mllvm -polly-vectorizer=stripmine"
+          fi
+          OPENMP_LIBS="-L/usr/local/lib -lomp"
+        else
+          { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: not found" >&5
+printf "%s\n" "not found" >&6; }
+          if test "x$enable_polly_omp" = "xyes"; then
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: Requested --enable-polly-omp but OpenMP headers/libs not found in /usr/local; skipping" >&5
+printf "%s\n" "$as_me: WARNING: Requested --enable-polly-omp but OpenMP headers/libs not found in /usr/local; skipping" >&2;}
+          fi
+        fi
+        ;;
+      *)
+        # Apple clang or unknown; skip Polly
+        if test "x$enable_polly_omp" = "xyes"; then
+          { printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: --enable-polly-omp requested but compiler is not LLVM clang; skipping" >&5
+printf "%s\n" "$as_me: WARNING: --enable-polly-omp requested but compiler is not LLVM clang; skipping" >&2;}
+        fi
+        ;;
+    esac
+    ;;
+  no)
+    ;;
+esac
 
 
 # Configure files to generate
